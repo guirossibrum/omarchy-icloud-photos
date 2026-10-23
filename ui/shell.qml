@@ -570,10 +570,11 @@ ShellRoot {
     }
   }
 
-  function toggleFavorite() {
-    if (!current || favoriteProc.running || current.state === undefined) return;
-    favoriteProc.command = [helperScript, "favorite", "--key", current.id,
-                            "--value", current.favorite === true ? "0" : "1"];
+  function toggleFavorite(item) {
+    var target = item || current;
+    if (!target || favoriteProc.running || target.state === undefined) return;
+    favoriteProc.command = [helperScript, "favorite", "--key", target.id,
+                            "--value", target.favorite === true ? "0" : "1"];
     favoriteProc.running = true;
   }
 
@@ -1823,6 +1824,7 @@ ShellRoot {
                       onSelectedChanged: if (selected) grid.reveal(this)
                       onContextMenuRequested: (x, y) => root.showCopyMenu(this, x, y, index)
                       onMenuRequested: (x, y) => root.showCopyMenu(this, x, y, index)
+                      onFavoriteRequested: root.toggleFavorite(root.items[index])
                       onClicked: modifiers => {
                         root.pinBottom = false;
                         if (modifiers & Qt.ShiftModifier) root.jumpTo(index, true);

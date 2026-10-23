@@ -20,6 +20,7 @@ Rectangle {
   signal clicked(int modifiers)
   signal contextMenuRequested(real x, real y)
   signal menuRequested(real x, real y)
+  signal favoriteRequested()
 
   width: size
   height: size
@@ -189,6 +190,29 @@ Rectangle {
     onClicked: mouse => {
       if (mouse.button === Qt.RightButton) root.contextMenuRequested(mouse.x, mouse.y);
       else root.clicked(mouse.modifiers);
+    }
+  }
+
+  Item {
+    visible: tileHover.hovered && !!item && item.state !== undefined && !root.checked
+    anchors.left: parent.left
+    anchors.bottom: parent.bottom
+    anchors.leftMargin: 5
+    anchors.bottomMargin: item && item.kind === "video" ? 35 : 5
+    width: 30; height: 30
+    Text {
+      anchors.centerIn: parent
+      text: item && item.favorite === true ? "\uf004" : "\uf08a"
+      color: "white"
+      font.family: root.theme.fontFamily
+      font.pixelSize: 17
+      style: Text.Outline
+      styleColor: root.theme.darkBackground
+    }
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.favoriteRequested()
     }
   }
 
