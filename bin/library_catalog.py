@@ -566,7 +566,9 @@ def main():
             evict(cat, args.ids)
     except (Exception, KeyboardInterrupt) as exc:
         if args.command == "sync":
-            status(cache, "auth-required" if isinstance(exc, PyiCloudFailedLoginException) or "session expired" in str(exc) else "error", str(exc))
+            state = "paused" if isinstance(exc, KeyboardInterrupt) else (
+                "auth-required" if isinstance(exc, PyiCloudFailedLoginException) or "session expired" in str(exc) else "error")
+            status(cache, state, "Sync paused; cached photos remain" if state == "paused" else str(exc))
         print(json.dumps(dict(ok=False, error=str(exc))), file=sys.stderr)
         raise SystemExit(1)
 

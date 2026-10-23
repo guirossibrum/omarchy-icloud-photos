@@ -470,6 +470,7 @@ ShellRoot {
   }
 
   function syncedLabel() {
+    if (status.state === "paused") return status.message || "Sync paused";
     if (busy) {
       // The sync script says what it is doing; the count grows as files land.
       var what = status.message || (status.state === "indexing" ? "Building thumbnails" : "Syncing");
