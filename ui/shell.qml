@@ -34,7 +34,7 @@ ShellRoot {
   property string activeSection: "library"
   property var albumRows: []
   property var coverAttempted: ({})
-  property bool initialCoversQueued: false
+  property var pendingCoverIds: []
   property bool demoMode: false
   property string albumAction: ""
   property string albumActionTarget: ""
@@ -253,23 +253,34 @@ ShellRoot {
   }
   Process {
     id: albumCoverProc
-    onExited: albumIndexFile.reload()
+    onExited: { albumIndexFile.reload(); albumCoverTimer.restart(); }
+  }
+  function enqueueAlbumCovers(ids) {
+    if (demoMode || needLogin) return;
+    var pending = pendingCoverIds.slice();
+    for (var i = 0; i < ids.length; i++) {
+      var key = ids[i];
+      if (!coverAttempted[key] && pending.indexOf(key) < 0) pending.push(key);
+    }
+    pendingCoverIds = pending;
+    if (pending.length) albumCoverTimer.restart();
   }
   Timer {
     id: albumCoverTimer
-    interval: 800
+    interval: 1200
     onTriggered: {
       if (root.demoMode || root.needLogin || albumCoverProc.running) return;
-      var rows;
-      if (root.folderView) rows = root.folderChildren();
-      else {
-        if (root.initialCoversQueued) return;
-        root.initialCoversQueued = true;
-        rows = root.albumRows.filter(function (row) { return !row.parent; }).slice(0, 5);
-      }
-      var keys = rows.filter(function (row) { return !row.isFolder && !row.cover && !root.coverAttempted[row.id]; })
-                     .slice(0, 8).map(function (row) { return row.id; });
+      // The sidebar queues the visible rows first. Folder cards contribute only
+      // their first screenful; scrolling the sidebar adds more as needed.
+      if (root.folderView) root.enqueueAlbumCovers(root.folderChildren().slice(0, 12)
+        .filter(function (row) { return !row.isFolder && !row.cover; })
+        .map(function (row) { return row.id; }));
+      var keys = root.pendingCoverIds.filter(function (key) {
+        var row = root.albumRows.find(function (entry) { return entry.id === key; });
+        return row && !row.isFolder && !row.cover && !root.coverAttempted[key];
+      }).slice(0, 4);
       if (!keys.length) return;
+      root.pendingCoverIds = root.pendingCoverIds.filter(function (key) { return keys.indexOf(key) < 0; });
       var tried = Object.assign({}, root.coverAttempted);
       keys.forEach(function (key) { tried[key] = true; });
       root.coverAttempted = tried;
@@ -1864,6 +1875,7 @@ ShellRoot {
         theme: appTheme
         section: root.activeSection
         albumRows: root.albumRows
+        onCoversNeeded: ids => root.enqueueAlbumCovers(ids)
         onSectionSelected: section => root.selectSection(section)
         onToggleRequested: root.sidebarOpen = false
       }

@@ -11,6 +11,7 @@ Rectangle {
   property var expandedFolders: ({})
   signal sectionSelected(string section)
   signal toggleRequested()
+  signal coversNeeded(var ids)
   function visibleAlbums() {
     var rows = [];
     for (var i = 0; i < albumRows.length; i++) {
@@ -46,9 +47,31 @@ Rectangle {
     expandedFolders = next;
   }
   onSectionChanged: revealSelection(section)
-  onAlbumRowsChanged: revealSelection(section)
+  onAlbumRowsChanged: { revealSelection(section); coverSignalTimer.restart(); }
+  onExpandedFoldersChanged: coverSignalTimer.restart()
+  onAlbumsExpandedChanged: coverSignalTimer.restart()
+  Component.onCompleted: coverSignalTimer.start()
 
-  color: theme.darkBackground
+  Timer {
+    id: coverSignalTimer
+    interval: 120
+    onTriggered: {
+      if (!root.expanded || !root.albumsExpanded) return;
+      var ids = [];
+      // Repeater items are laid out in body, the Flickable's content item.
+      // Include one row on either side to avoid an empty cover while scrolling.
+      for (var i = 0; i < albumRepeater.count; i++) {
+        var item = albumRepeater.itemAt(i);
+        if (!item || !item.modelData || item.modelData.isFolder || item.modelData.cover) continue;
+        if (item.y + item.height >= sidebarFlick.contentY - 33 &&
+            item.y <= sidebarFlick.contentY + sidebarFlick.height + 33)
+          ids.push(item.modelData.id);
+      }
+      if (ids.length) root.coversNeeded(ids);
+    }
+  }
+
+  color: "#202023"
   readonly property var photoRows: [
     { key: "library", label: "Library", icon: "\uf03e" },
     { key: "favorites", label: "Favorites", icon: "\uf004" },
@@ -64,17 +87,17 @@ Rectangle {
     anchors.right: parent.right
     width: 1
     height: parent.height
-    color: theme.lighterBackground
+    color: "#3a3a3d"
   }
 
   Rectangle {
     id: toggle
     x: 11; y: 8; width: 30; height: 28; radius: 5
-    color: toggleArea.containsMouse ? theme.lighterBackground : "transparent"
+    color: toggleArea.containsMouse ? "#303034" : "transparent"
     Text {
       anchors.centerIn: parent
       text: "\uf0db"
-      color: theme.accent
+      color: "#00aaff"
       font.family: theme.fontFamily
       font.pixelSize: 16
     }
@@ -88,6 +111,7 @@ Rectangle {
   }
 
   Flickable {
+    id: sidebarFlick
     visible: root.expanded
     anchors.top: toggle.bottom
     anchors.topMargin: 13
@@ -98,6 +122,8 @@ Rectangle {
     contentWidth: width
     contentHeight: body.implicitHeight + 24
     boundsBehavior: Flickable.StopAtBounds
+    onContentYChanged: coverSignalTimer.restart()
+    onHeightChanged: coverSignalTimer.restart()
 
     Column {
       id: body
@@ -108,9 +134,9 @@ Rectangle {
         x: 17
         height: 25
         text: "Photos"
-        color: theme.foreground
-        font.family: theme.fontFamily
-        font.pixelSize: theme.fontSize - 1
+        color: "#a5a5aa"
+        font.family: "sans-serif"
+        font.pixelSize: 14
       }
       Repeater {
         model: root.photoRows
@@ -129,27 +155,28 @@ Rectangle {
         x: 17
         height: 25
         text: "Collections"
-        color: theme.foreground
-        font.family: theme.fontFamily
-        font.pixelSize: theme.fontSize - 1
+        color: "#a5a5aa"
+        font.family: "sans-serif"
+        font.pixelSize: 14
       }
       Rectangle {
         x: 8; width: parent.width - 16; height: 33; radius: 7
-        color: root.section === "albums" ? Qt.lighter(theme.darkBackground, 1.55) :
-               albumsArea.containsMouse ? Qt.lighter(theme.darkBackground, 1.25) : "transparent"
-        Text { x: 8; anchors.verticalCenter: parent.verticalCenter; text: root.albumsExpanded ? "⌄" : "›"; color: theme.darkForeground; font.pixelSize: 16 }
-        Text { x: 39; anchors.verticalCenter: parent.verticalCenter; text: "\uf07b"; color: theme.accent; font.family: theme.fontFamily; font.pixelSize: 16 }
-        Text { x: 70; anchors.verticalCenter: parent.verticalCenter; text: "Albums"; color: theme.brightForeground; font.family: theme.fontFamily; font.pixelSize: theme.fontSize }
+        color: root.section === "albums" ? "#414144" : albumsArea.containsMouse ? "#303034" : "transparent"
+        Text { x: 8; anchors.verticalCenter: parent.verticalCenter; text: root.albumsExpanded ? "⌄" : "›"; color: "#909095"; font.pixelSize: 16 }
+        SidebarEntry { x: 23; width: 42; height: parent.height; theme: root.theme; folderIcon: true; enabled: false }
+        Text { x: 70; anchors.verticalCenter: parent.verticalCenter; text: "Albums"; color: "#f5f5f7"; font.family: "sans-serif"; font.pixelSize: 14 }
         MouseArea { id: albumsArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.sectionSelected("albums") }
         MouseArea { x: 0; width: 31; height: parent.height; cursorShape: Qt.PointingHandCursor; onClicked: root.albumsExpanded = !root.albumsExpanded }
       }
       Repeater {
+        id: albumRepeater
         model: root.albumsExpanded ? root.visibleAlbums() : []
         delegate: SidebarEntry {
           required property var modelData
           theme: root.theme
           label: modelData.title
           icon: modelData.isFolder ? "\uf07b" : "\uf03e"
+          folderIcon: modelData.isFolder
           thumbnail: modelData.isFolder ? "" : (modelData.cover || "")
           indent: 16 + Math.min(modelData.depth || 0, 7) * 13
           expandable: modelData.isFolder
@@ -165,12 +192,12 @@ Rectangle {
       }
       Rectangle {
         x: 8; width: parent.width - 16; height: 33; radius: 7
-        color: mediaArea.containsMouse ? Qt.lighter(theme.darkBackground, 1.25) : "transparent"
+        color: mediaArea.containsMouse ? "#303034" : "transparent"
         Text {
           x: 8
           anchors.verticalCenter: parent.verticalCenter
           text: root.mediaExpanded ? "⌄" : "›"
-          color: theme.darkForeground
+          color: "#909095"
           font.family: theme.fontFamily
           font.pixelSize: 16
         }
@@ -178,7 +205,7 @@ Rectangle {
           x: 39
           anchors.verticalCenter: parent.verticalCenter
           text: "\uf07b"
-          color: theme.accent
+          color: "#00aaff"
           font.family: theme.fontFamily
           font.pixelSize: 16
         }
@@ -186,9 +213,9 @@ Rectangle {
           x: 70
           anchors.verticalCenter: parent.verticalCenter
           text: "Media Types"
-          color: theme.brightForeground
-          font.family: theme.fontFamily
-          font.pixelSize: theme.fontSize
+          color: "#f5f5f7"
+          font.family: "sans-serif"
+          font.pixelSize: 14
         }
         MouseArea {
           id: mediaArea
@@ -216,9 +243,9 @@ Rectangle {
         x: 17
         height: 25
         text: "Sharing"
-        color: theme.foreground
-        font.family: theme.fontFamily
-        font.pixelSize: theme.fontSize - 1
+        color: "#a5a5aa"
+        font.family: "sans-serif"
+        font.pixelSize: 14
       }
       SidebarEntry {
         theme: root.theme
