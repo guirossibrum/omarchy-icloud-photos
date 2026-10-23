@@ -50,6 +50,15 @@ def libraries(api, choice="auto"):
             yield zone, library
 
 
+def newest_first(library):
+    """The installed pyicloud album starts at the newest asset at rank zero.
+
+    Its CloudKit query says ASCENDING, but that is the direction through index
+    ranks, which are newest-first. Keep its pagination untouched.
+    """
+    return library.all
+
+
 def metadata(asset, account, zone):
     master, record = asset._master_record, asset._asset_record
     name = asset.filename
@@ -93,7 +102,7 @@ class Catalog:
               record TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
               captured TEXT, ts REAL, width INTEGER, height INTEGER,
               timezone TEXT, location TEXT, camera TEXT, size INTEGER, thumb TEXT,
-              added_at REAL, favorite INTEGER,
+              added_at REAL, favorite INTEGER, rank INTEGER,
               original TEXT, motion TEXT, owned INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL DEFAULT 'cloud-only', error TEXT,
               seen INTEGER NOT NULL DEFAULT 0,
@@ -104,7 +113,7 @@ class Catalog:
               PRIMARY KEY(account, zone));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(assets)")}
-        for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER")):
+        for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER"), ("rank", "INTEGER")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE assets ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -112,14 +121,14 @@ class Catalog:
     def upsert(self, data, seen):
         self.db.execute("""INSERT INTO assets
             (id, account, zone, record, name, kind, captured, ts, width, height,
-             timezone, location, camera, size, added_at, favorite, seen)
+             timezone, location, camera, size, added_at, favorite, rank, seen)
             VALUES (:id,:account,:zone,:record,:name,:kind,:captured,:ts,:width,:height,
-                    :timezone,:location,:camera,:size,:added_at,:favorite,:seen)
+                    :timezone,:location,:camera,:size,:added_at,:favorite,:rank,:seen)
             ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind,
             captured=excluded.captured, ts=excluded.ts, width=excluded.width,
             height=excluded.height, location=excluded.location, camera=excluded.camera,
             size=excluded.size, timezone=excluded.timezone, added_at=excluded.added_at,
-            favorite=excluded.favorite, seen=excluded.seen,
+            favorite=excluded.favorite, rank=excluded.rank, seen=excluded.seen,
             state=CASE WHEN assets.state IN ('deleted','absent') THEN 'cloud-only' ELSE assets.state END""", {**data, "seen": seen})
 
     def get(self, key):
@@ -185,7 +194,7 @@ def cloud(cfg):
 def matching_asset(library, record):
     # pyicloud's public album interface does not offer a record lookup. Walk
     # every page by stable ID; never match a duplicate filename or stale URL.
-    for asset in library.all:
+    for asset in newest_first(library):
         if asset.id == record:
             return asset
     raise ValueError("asset no longer exists in the selected library")
@@ -214,6 +223,64 @@ def thumbnail_version(asset):
         if raw and raw.get("downloadURL"):
             return AssetVersion(raw.get("size", 0), raw["downloadURL"], "image/jpeg", raw.get("fileChecksum", ""))
     return None
+
+
+def cache_thumbnail(cat, library, asset, key):
+    """Fetch only the thumbnail version and publish it under the stable key."""
+    thumb = cat.cache / "thumbs" / (key + ".jpg")
+    if not thumb.is_file():
+        value = thumbnail_version(asset)
+        if value is None:
+            return False
+        try:
+            transfer(asset, library, value, thumb)
+        except Exception:
+            return False  # Never substitute an original for a failed thumb.
+    if thumb.is_file():
+        cat.db.execute("UPDATE assets SET thumb=? WHERE id=? AND account=?", (str(thumb), key, cat.account))
+        return True
+    return False
+
+
+def visible_priority(cat):
+    """Read the viewer's nearest visible cloud keys, newest request first."""
+    path = cat.cache / "priority.json"
+    try:
+        payload = json.loads(path.read_text())
+        if time.time() - payload["at"] > 300:
+            return []
+        return [key for key in payload["ids"][:120] if isinstance(key, str)]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def fetch_visible_thumbnails(cat, libraries_by_zone, page_limit=2):
+    """Seek to up to two on-screen pages before sequential thumbnail work."""
+    pages = {}
+    for key in visible_priority(cat):
+        row = cat.db.execute("SELECT zone, rank, thumb FROM assets WHERE id=? AND account=?", (key, cat.account)).fetchone()
+        if row is None or row["rank"] is None or (row["thumb"] and Path(row["thumb"]).is_file()) or row["zone"] not in libraries_by_zone:
+            continue
+        zone = row["zone"]
+        page_size = getattr(libraries_by_zone[zone].all, "page_size", 100)
+        page = row["rank"] // page_size * page_size
+        group = (zone, page, page_size)
+        if group not in pages and len(pages) >= page_limit:
+            continue
+        pages.setdefault(group, set()).add(key)
+    changed = False
+    for (zone, page, page_size), keys in pages.items():
+        library = libraries_by_zone[zone]
+        album = newest_first(library)
+        album.offset = page
+        for asset in islice(album, page_size):
+            key = item_key(cat.account, zone, asset.id)
+            if key in keys and cache_thumbnail(cat, library, asset, key):
+                changed = True
+    if changed:
+        cat.db.commit()
+        cat.export()
+    return changed
 
 
 def transfer(asset, library, version_value, destination, progress=None):
@@ -399,9 +466,15 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
     publish_step = 30
     last_publish_at = time.monotonic()
     thumbnail_libraries = []
+    libraries_by_zone = {}
+    first_assets = []
+    priority_keys = set()
+    last_priority_read = 0
+    last_priority_fetch = 0
     for zone, library in libraries(api, cfg.get("SHARED_LIBRARY", "auto")):
         if max_items is not None and count >= max_items:
             break
+        libraries_by_zone[zone] = library
         last = cat.db.execute("SELECT full_at FROM scans WHERE account=? AND zone=?", (cat.account, zone)).fetchone()
         # A capped preview is never a complete scan: it must not mark unseen
         # records absent or make the next normal sync skip older pages.
@@ -411,9 +484,11 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
         # The pyicloud iterator performs complete offset pagination. On routine
         # runs, stop after two full pages of already known records.
         known_streak = 0
-        source = islice(library.all, max_items - count) if max_items is not None else library.all
+        ordered = newest_first(library)
+        source = islice(ordered, max_items - count) if max_items is not None else ordered
         for asset in source:
             data = metadata(asset, cat.account, zone)
+            data["rank"] = zone_count
             previous = cat.db.execute("SELECT * FROM assets WHERE id=?", (data["id"],)).fetchone()
             existed = previous is not None
             if previous is None or any(previous[k] != v for k, v in data.items()) or previous["state"] in ("deleted", "absent"):
@@ -425,6 +500,14 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
             thumb = cat.cache / "thumbs" / (data["id"] + ".jpg")
             if not thumb.is_file() or previous is None or previous["thumb"] != str(thumb):
                 needs_thumbnails = True
+            if count <= 30 and not thumb.is_file():
+                first_assets.append((library, asset, data["id"]))
+            if time.monotonic() - last_priority_read >= 2:
+                priority_keys = set(visible_priority(cat))
+                last_priority_read = time.monotonic()
+            if data["id"] in priority_keys and not thumb.is_file() and count > 30:
+                if cache_thumbnail(cat, library, asset, data["id"]):
+                    changed = True
             if count >= next_publish or time.monotonic() - last_publish_at >= 5:
                 cat.db.commit()
                 if changed:
@@ -435,6 +518,21 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
                 if count >= next_publish:
                     publish_step = min(publish_step * 2, 2000)
                     next_publish += publish_step
+                if count >= 30 and first_assets:
+                    # Make the first visible cards useful before continuing a
+                    # potentially long metadata traversal.
+                    for position, (first_library, first_asset, first_key) in enumerate(first_assets):
+                        if cache_thumbnail(cat, first_library, first_asset, first_key):
+                            changed = True
+                        if (position + 1) % 5 == 0 or position + 1 == len(first_assets):
+                            cat.db.commit()
+                            if changed:
+                                cat.export()
+                                changed = False
+                    first_assets.clear()
+                if time.monotonic() - last_priority_fetch >= 3:
+                    fetch_visible_thumbnails(cat, libraries_by_zone)
+                    last_priority_fetch = time.monotonic()
             if max_items is None and not whole and known_streak >= 200:
                 break
         with cat.db:
@@ -453,12 +551,13 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
         cat.export()
         changed = False
     status(cat.cache, "syncing", f"Loading thumbnails (0/{count})")
+    fetch_visible_thumbnails(cat, libraries_by_zone)
     thumbnails = 0
     next_thumb_publish = 20
     thumb_step = 20
     last_thumb_publish_at = time.monotonic()
     for zone, library, zone_count in thumbnail_libraries:
-        for asset in islice(library.all, zone_count):
+        for asset in islice(newest_first(library), zone_count):
             key = item_key(cat.account, zone, asset.id)
             try:
                 row = cat.get(key)
@@ -467,15 +566,7 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
                 # thumbnail passes. The next sync will catalog new records.
                 continue
             thumb = cat.cache / "thumbs" / (key + ".jpg")
-            if not thumb.is_file():
-                thumb_version = thumbnail_version(asset)
-                if thumb_version is not None:
-                    try:
-                        transfer(asset, library, thumb_version, thumb)
-                    except Exception:
-                        pass  # Placeholder remains; never fall back to original.
-            if thumb.is_file() and row["thumb"] != str(thumb):
-                cat.db.execute("UPDATE assets SET thumb=? WHERE id=?", (str(thumb), key))
+            if (not thumb.is_file() or row["thumb"] != str(thumb)) and cache_thumbnail(cat, library, asset, key):
                 changed = True
             thumbnails += 1
             if thumbnails >= next_thumb_publish or time.monotonic() - last_thumb_publish_at >= 5:
@@ -484,6 +575,7 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
                     cat.export()
                     changed = False
                 status(cat.cache, "syncing", f"Loading thumbnails ({thumbnails}/{count})")
+                fetch_visible_thumbnails(cat, libraries_by_zone)
                 last_thumb_publish_at = time.monotonic()
                 if thumbnails >= next_thumb_publish:
                     thumb_step = min(thumb_step * 2, 2000)
@@ -550,6 +642,8 @@ def main():
     scan.add_argument("--full", action="store_true")
     scan.add_argument("--max-items", type=int, help="preview at most this many cloud records without marking a full scan")
     sub.add_parser("export")
+    priority = sub.add_parser("prioritize")
+    priority.add_argument("ids", nargs="*")
     get = sub.add_parser("download"); get.add_argument("id"); get.add_argument("--component", choices=("original", "motion"), default="original")
     remove = sub.add_parser("evict"); remove.add_argument("ids", nargs="+")
     convert = sub.add_parser("convert"); convert.add_argument("ids", nargs="+")
@@ -580,6 +674,10 @@ def main():
                 status(cache, "ok", "", n)
         elif args.command == "export":
             cat.export()
+        elif args.command == "prioritize":
+            # Only stable catalog keys are written. The sync resolves them
+            # against the current account before any cloud request.
+            atomic_json(cache / "priority.json", {"at": time.time(), "ids": args.ids[:120]})
         elif args.command == "download":
             download(cat, cfg, args.id, args.component)
         elif args.command == "convert":

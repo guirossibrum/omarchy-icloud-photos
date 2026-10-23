@@ -35,6 +35,7 @@ ShellRoot {
   property string searchText: ""
   property bool sidebarOpen: true
   property bool slideshowRunning: false
+  property string prioritySignature: ""
   property int selected: -1
   onSelectedChanged: if (grid && !suppressReveal) grid.revealIndex(selected)
   // OMARCHY_ICLOUD_PHOTOS_TOUR=1: scroll the grid from top to bottom by itself and
@@ -170,6 +171,7 @@ ShellRoot {
       if (root.appleId && next !== root.appleId) { root.libraryItems = []; root.rebuild([], -1); root.startSync(); }
       root.appleId = next;
       root.configLoaded = true;
+      if (root.appleId && root.indexMissing && !sync.running) root.startSync();
     }
     onLoadFailed: { root.appleId = ""; root.configLoaded = true; }
     onFileChanged: reload()
@@ -231,6 +233,36 @@ ShellRoot {
       indexFile.reload();
       toast.show(code === 0 ? "Local download removed; copy kept in iCloud" : "Could not remove local download", 3500);
     }
+  }
+  Process {
+    id: priorityProc
+    property bool repeatNeeded: false
+    onExited: (code, status) => {
+      if (code !== 0) root.prioritySignature = "";
+      if (repeatNeeded) { repeatNeeded = false; priorityTimer.restart(); }
+    }
+  }
+  Timer {
+    id: priorityTimer
+    interval: 180
+    onTriggered: root.publishViewportPriority()
+  }
+  Timer {
+    interval: 2000
+    repeat: true
+    running: true
+    onTriggered: root.publishViewportPriority()
+  }
+
+  function publishViewportPriority() {
+    if (needLogin || items.length === 0) return;
+    if (priorityProc.running) { priorityProc.repeatNeeded = true; return; }
+    var ids = grid.priorityIds();
+    var signature = ids.join(",");
+    if (ids.length === 0 || signature === prioritySignature) return;
+    prioritySignature = signature;
+    priorityProc.command = [catalogScript, "prioritize"].concat(ids);
+    priorityProc.running = true;
   }
 
   function downloadLine(data) {
@@ -410,6 +442,15 @@ ShellRoot {
     var keepId = current ? current.id : null;
     libraryItems = list;
     list = filterItems(list);
+    // Thumbnail and download-state updates do not change tile geometry.
+    // Updating the existing delegates in place prevents visible flicker.
+    if (list.length === items.length && list.every(function (it, i) {
+      return it.id === root.items[i].id && it.date === root.items[i].date;
+    })) {
+      items = list;
+      priorityTimer.restart();
+      return;
+    }
     var idx = -1;
     if (keepId) for (var j = 0; j < list.length; j++) if (list[j].id === keepId) { idx = j; break; }
     rebuild(list, idx >= 0 ? idx : list.length - 1);
@@ -939,6 +980,7 @@ ShellRoot {
   // again while the new content height settles.
   function rebuild(list, sel) {
     var y = grid.contentY;
+    grid.pendingAnchor = pinBottom ? null : grid.captureAnchor();
     suppressReveal = true;
     grid.restoreY = pinBottom ? -1 : y;
     items = list;
@@ -951,6 +993,7 @@ ShellRoot {
       setChecked(map);
     }
     if (pinBottom) grid.scrollToBottom(); else grid.contentY = grid.clampY(y);
+    if (grid.pendingAnchor) Qt.callLater(function () { grid.restorePendingAnchor(); });
     settleTimer.restart();
   }
 
@@ -1008,7 +1051,12 @@ ShellRoot {
   Timer {
     id: settleTimer
     interval: 150
-    onTriggered: { root.suppressReveal = false; grid.restoreY = -1; }
+    onTriggered: {
+      grid.restorePendingAnchor();
+      root.suppressReveal = false;
+      grid.restoreY = -1;
+      priorityTimer.restart();
+    }
   }
 
   FloatingWindow {
@@ -1381,16 +1429,83 @@ ShellRoot {
 
         // Scroll position to hold while a rebuild changes the content height.
         property real restoreY: -1
+        property var pendingAnchor: null
 
         function clampY(y) { return Math.max(0, Math.min(contentHeight - height, y)); }
         function scrollToBottom() {
           contentY = Math.max(0, contentHeight - height);
         }
+        function tileTop(dayIndex, position) {
+          var section = daysRepeater.itemAt(dayIndex);
+          if (!section) return -1;
+          var point = section.mapToItem(contentItem, 0, 0);
+          return point.y + section.labelHeight + 10 + Math.floor(position / columns) * (cellFit + root.gap);
+        }
+        function captureAnchor() {
+          if (root.items.length === 0) return null;
+          for (var d = 0; d < root.days.length; d++) {
+            var group = root.days[d];
+            var first = tileTop(d, 0);
+            if (first < 0) continue;
+            var rows = Math.ceil(group.indices.length / columns);
+            if (first + rows * (cellFit + root.gap) < contentY) continue;
+            var row = Math.max(0, Math.min(rows - 1, Math.floor((contentY - first) / (cellFit + root.gap))));
+            var index = group.indices[row * columns];
+            return { id: root.items[index].id, offset: contentY - tileTop(d, row * columns) };
+          }
+          return null;
+        }
+        function restorePendingAnchor() {
+          if (!pendingAnchor || root.pinBottom) return;
+          for (var d = 0; d < root.days.length; d++) {
+            var group = root.days[d];
+            for (var p = 0; p < group.indices.length; p++) {
+              if (root.items[group.indices[p]].id !== pendingAnchor.id) continue;
+              var top = tileTop(d, p);
+              if (top < 0) return;
+              contentY = clampY(top + pendingAnchor.offset);
+              restoreY = -1;
+              pendingAnchor = null;
+              return;
+            }
+          }
+          pendingAnchor = null;
+        }
+        function priorityIds() {
+          var candidates = [];
+          var low = Math.max(0, contentY - height);
+          var high = contentY + 2 * height;
+          var center = contentY + height / 2;
+          for (var d = 0; d < root.days.length; d++) {
+            var group = root.days[d];
+            var first = tileTop(d, 0);
+            if (first < 0) continue;
+            var rows = Math.ceil(group.indices.length / columns);
+            if (first > high) break;
+            if (first + rows * (cellFit + root.gap) < low) continue;
+            var firstRow = Math.max(0, Math.floor((low - first) / (cellFit + root.gap)));
+            var lastRow = Math.min(rows - 1, Math.ceil((high - first) / (cellFit + root.gap)));
+            for (var row = firstRow; row <= lastRow; row++) {
+              var distance = Math.abs(first + row * (cellFit + root.gap) + cellFit / 2 - center);
+              for (var col = 0; col < columns; col++) {
+                var pos = row * columns + col;
+                if (pos >= group.indices.length) break;
+                var it = root.items[group.indices[pos]];
+                if (it && !it.thumb) candidates.push({ id: it.id, distance: distance });
+              }
+            }
+          }
+          candidates.sort(function (a, b) { return a.distance - b.distance; });
+          return candidates.slice(0, 120).map(function (candidate) { return candidate.id; });
+        }
         onContentHeightChanged: {
           if (root.pinBottom) scrollToBottom();
+          else if (pendingAnchor) Qt.callLater(function () { grid.restorePendingAnchor(); });
           else if (restoreY >= 0) contentY = clampY(restoreY);
         }
-        onHeightChanged: if (root.pinBottom) scrollToBottom()
+        onHeightChanged: { if (root.pinBottom) scrollToBottom(); priorityTimer.restart(); }
+        onWidthChanged: priorityTimer.restart()
+        onContentYChanged: priorityTimer.restart()
         onMovementStarted: {
           root.pinBottom = false;
           scrollAnim.stop();

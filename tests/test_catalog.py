@@ -70,18 +70,46 @@ class Asset:
         return 8
 
 
+class Album:
+    def __init__(self, library):
+        self.library = library
+        self.offset = 0
+
+    def __len__(self):
+        return len(self.library.assets)
+
+    def increment_offset(self, value):
+        self.offset += value
+
+    def _list_query_gen(self, offset, list_type, query_filter=None):
+        return {"query": {"filterBy": [
+            {"fieldName": "startRank", "fieldValue": {"value": offset}},
+            {"fieldName": "direction", "fieldValue": {"value": "ASCENDING"}},
+        ]}}
+
+    def __iter__(self):
+        query = self._list_query_gen(self.offset, "fabricated-album")
+        direction = query["query"]["filterBy"][1]["fieldValue"]["value"]
+        self.library.orders.append(direction)
+        assets = self.library.assets if direction == "ASCENDING" else list(reversed(self.library.assets))
+        while self.offset < len(assets):
+            start = self.offset
+            self.library.pages += 1
+            for asset in assets[start:start + 100]:
+                yield asset
+                self.increment_offset(1)
+
+
 class Library:
     def __init__(self, assets):
         self.assets = assets
         self.session = type("Session", (), {"calls": []})()
         self.pages = 0
+        self.orders = []
 
     @property
     def all(self):
-        # Emulate a cloud album with 100-item pages.
-        for start in range(0, len(self.assets), 100):
-            self.pages += 1
-            yield from self.assets[start:start + 100]
+        return Album(self)
 
 
 class API:
@@ -165,6 +193,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(migrated.get("fabricated-key")["name"], "fabricated.jpg")
         self.assertIsNone(migrated.get("fabricated-key")["favorite"])
         self.assertIsNone(migrated.get("fabricated-key")["added_at"])
+        self.assertIsNone(migrated.get("fabricated-key")["rank"])
 
     def test_first_sync_publishes_cards_before_thumbnail_requests(self):
         exports = []
@@ -187,12 +216,29 @@ class CatalogTests(unittest.TestCase):
             catalog.sync(self.cat, self.cfg, self.api)
         self.assertEqual(exports[0], 30)
         self.assertTrue(any(30 < count < 652 for count in exports))
-        self.assertEqual(len(first_transfer[0]), 652)
+        self.assertEqual(len(first_transfer[0]), 30)
         self.assertTrue(all(not item["downloaded"] and not item["thumb"] for item in first_transfer[0]))
+
+    def test_viewport_priority_seeks_to_older_visible_page(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=500)
+        key = catalog.item_key(self.cat.account, "PrimarySync", "p400")
+        thumb = Path(self.cat.get(key)["thumb"])
+        thumb.unlink()
+        catalog.atomic_json(self.cache / "priority.json", {"at": __import__("time").time(), "ids": [key]})
+        pages_before = self.personal.pages
+        self.assertTrue(catalog.fetch_visible_thumbnails(self.cat, {"PrimarySync": self.personal}))
+        self.assertEqual(self.personal.pages - pages_before, 1)
+        self.assertTrue(thumb.is_file())
+        self.assertEqual(self.personal.session.calls[-1], "thumb:PrimarySync:p400")
+        self.assertIsNone(self.cat.get(key)["original"])
 
     def test_capped_preview_keeps_future_full_scan_available(self):
         count = catalog.sync(self.cat, self.cfg, self.api, max_items=120)
         self.assertEqual(count, 120)
+        self.assertEqual(self.personal.orders, ["ASCENDING", "ASCENDING"])
+        self.assertIsNotNone(self.cat.get(catalog.item_key(self.cat.account, "PrimarySync", "p0")))
+        with self.assertRaises(ValueError):
+            self.cat.get(catalog.item_key(self.cat.account, "PrimarySync", "p649"))
         self.assertEqual(len(json.loads((self.cache / "index.json").read_text())), 120)
         self.assertEqual(self.cat.db.execute("SELECT COUNT(*) FROM scans").fetchone()[0], 0)
         self.assertEqual(self.cat.db.execute("SELECT COUNT(*) FROM assets WHERE original IS NOT NULL").fetchone()[0], 0)
