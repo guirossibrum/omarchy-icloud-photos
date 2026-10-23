@@ -1695,7 +1695,7 @@ ShellRoot {
         downloadState: root.current && root.current.id === root.downloadingId ? "downloading" :
                        root.current && !root.current.downloaded &&
                        (root.current.id === root.failedDownloadId || root.current.state === "failed") ? "failed" : ""
-        downloadMessage: root.downloadError || (root.current ? root.current.error : "")
+        downloadMessage: root.downloadError || (root.current ? (root.current.error || "") : "")
         downloadComponent: root.downloadingComponent
         downloadPercent: root.downloadPercent
         infoOpen: root.infoOpen
