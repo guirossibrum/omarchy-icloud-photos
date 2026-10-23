@@ -258,6 +258,7 @@ def cmd_delete(args, cfg):
             with cat.db:
                 cat.db.execute("UPDATE assets SET state='deleted' WHERE id=?", (args.key,))
             cat.export()
+            cat.db.close()
 
     trash_dir = CACHE / "trash" / args.key
     trash_dir.mkdir(parents=True, exist_ok=True)
@@ -292,6 +293,7 @@ def cmd_restore(args, cfg):
         with cat.db:
             cat.db.execute("UPDATE assets SET state='cloud-only' WHERE id=?", (args.key,))
         cat.export()
+        cat.db.close()
 
     for src, dest in manifest["files"]:
         if os.path.isfile(dest):

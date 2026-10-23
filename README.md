@@ -164,6 +164,8 @@ icloudpd --auth-only --username you@example.com --cookie-directory ~/.config/icl
 
 The catalog publishes `index.json` and `status.json` for Quickshell. Initial catalog creation is a full scan; routine refresh stops after two pages of known items and a weekly full reconciliation catches older changes. Downloads stream into `.part` files and become visible only after completion. The downloader and local eviction share a per-item lock. Existing originals in `LIBRARY` are matched once by zone, filename and capture time, then treated as unowned; ambiguous matches are left cloud-only.
 
+An HDR video can be converted to an app-owned SDR playback copy after its original is downloaded with `omarchy-icloud-photos-sync --convert ID`, or `--convert-all` for downloaded videos. The latter waits for AC power unless passed `--force`. Conversion updates the catalog index and does not scan the backup folders.
+
 The catalog uses the album, version and authenticated download interfaces in the installed `icloudpd` 1.32.3 pyicloud package. It does not require a new dependency. iCloud's private API can change; a video without an exposed JPEG poster intentionally remains a placeholder in the grid until its original is opened.
 
 `bin/icloud_helper.py` is the only code that talks to iCloud beyond downloading: it signs in, and it moves one asset at a time to Recently Deleted or back, in whichever library it came from. The Shared Library sits in the owner's private database next to the personal one and in the shared database of everyone who joined, so the helper looks in both. It runs on the pyicloud module that ships with icloudpd, in the repository's own virtualenv.

@@ -129,6 +129,7 @@ class Catalog:
             motion = r["motion"] if r["motion"] and Path(r["motion"]).is_file() else ""
             thumb = r["thumb"] if r["thumb"] and Path(r["thumb"]).is_file() else ""
             derived = self.cache / "previews" / (r["id"] + ".jpg")
+            sdr = self.cache / "videos" / (r["id"] + ".mp4")
             ts = r["ts"] or 0
             local = datetime.fromtimestamp(ts).astimezone() if r["ts"] is not None else None
             items.append(dict(id=r["id"], record=r["record"], zone=r["zone"],
@@ -137,7 +138,7 @@ class Catalog:
                 date=local.strftime("%Y-%m-%d") if local else "Unknown",
                 time=local.strftime("%H:%M") if local else "",
                 thumb=thumb, preview=str(derived) if original and derived.is_file() else (original or thumb), path=original,
-                video=original if r["kind"] == "video" else motion,
+                video=(str(sdr) if sdr.is_file() else original) if r["kind"] == "video" else motion,
                 shared=r["zone"] != "PrimarySync", duration=0,
                 width=r["width"], height=r["height"], location=json.loads(r["location"]) if r["location"] else None,
                 camera=r["camera"], size=r["size"], downloaded=bool(original),
@@ -331,6 +332,49 @@ def evict(cat, keys):
     cat.export()
 
 
+def convert_video(cat, key):
+    """Build an app-owned SDR playback copy when ffprobe detects HDR."""
+    with asset_lock(cat.cache, key):
+        row = cat.get(key)
+        source = row["original"]
+        if row["kind"] != "video" or not source or not Path(source).is_file():
+            raise ValueError("video original is not downloaded")
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_entries", "stream=color_transfer", "-of", "csv=p=0", source],
+                               capture_output=True, text=True, check=True)
+        if probe.stdout.strip() not in ("arib-std-b67", "smpte2084"):
+            return False
+        dest = cat.cache / "videos" / (key + ".mp4")
+        if dest.is_file() and dest.stat().st_mtime >= Path(source).stat().st_mtime:
+            return True
+        dest.parent.mkdir(exist_ok=True)
+        temp = dest.with_name(dest.stem + f".{os.getpid()}.tmp.mp4")
+        command = ["ffmpeg", "-v", "error", "-y", "-i", source,
+                   "-vf", "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=w='if(gt(iw,ih),min(2200,iw),-2)':h='if(gt(iw,ih),-2,min(2200,ih))'",
+                   "-threads", "2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                   "-maxrate", "8M", "-bufsize", "16M", "-c:a", "aac", "-b:a", "128k",
+                   "-movflags", "+faststart", str(temp)]
+        process = subprocess.Popen(command)
+        try:
+            if process.wait() != 0:
+                raise RuntimeError("HDR video conversion failed")
+            os.replace(temp, dest)
+        except BaseException:
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+            raise
+        finally:
+            temp.unlink(missing_ok=True)
+    cat.export()
+    return True
+
+
+def on_ac():
+    supplies = list(Path("/sys/class/power_supply").glob("*/online"))
+    return not supplies or any(path.read_text().strip() == "1" for path in supplies if path.is_file())
+
+
 def sync(cat, cfg, api=None, full=False):
     api = api or cloud(cfg)
     now = int(time.time())
@@ -433,6 +477,8 @@ def main():
     sub.add_parser("export")
     get = sub.add_parser("download"); get.add_argument("id"); get.add_argument("--component", choices=("original", "motion"), default="original")
     remove = sub.add_parser("evict"); remove.add_argument("ids", nargs="+")
+    convert = sub.add_parser("convert"); convert.add_argument("ids", nargs="+")
+    sub.add_parser("convert-all").add_argument("--force", action="store_true")
     args = parser.parse_args()
     cfg = read_config()
     cfg.setdefault("COOKIES", str(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "icloudpd"))
@@ -452,6 +498,14 @@ def main():
             cat.export()
         elif args.command == "download":
             download(cat, cfg, args.id, args.component)
+        elif args.command == "convert":
+            for key in args.ids:
+                convert_video(cat, key)
+        elif args.command == "convert-all":
+            if not args.force and not on_ac():
+                raise RuntimeError("plug in or pass --force to convert all videos")
+            for row in cat.db.execute("SELECT id FROM assets WHERE account=? AND kind='video' AND original IS NOT NULL", (cat.account,)).fetchall():
+                convert_video(cat, row["id"])
         else:
             evict(cat, args.ids)
     except (Exception, KeyboardInterrupt) as exc:

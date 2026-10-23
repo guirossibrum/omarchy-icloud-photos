@@ -147,6 +147,23 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(self.cat.get(key)["original"])
         self.assertFalse(any(url.startswith("original:") for url in self.personal.session.calls))
 
+    def test_hdr_conversion_preserves_full_catalog_and_evicts_playback_copy(self):
+        catalog.sync(self.cat, self.cfg, self.api)
+        key = catalog.item_key(self.cat.account, "SharedSync-fabricated", "p0")
+        catalog.download(self.cat, self.cfg, key, api=self.api)
+        def spawn(command):
+            Path(command[-1]).write_bytes(b"fabricated-sdr")
+            return SimpleNamespace(wait=lambda: 0, poll=lambda: 0)
+        with patch.object(catalog.subprocess, "run", return_value=SimpleNamespace(stdout="arib-std-b67")), \
+             patch.object(catalog.subprocess, "Popen", side_effect=spawn):
+            self.assertTrue(catalog.convert_video(self.cat, key))
+        index = __import__("json").loads((self.cache / "index.json").read_text())
+        self.assertEqual(len(index), 652)
+        item = next(x for x in index if x["id"] == key)
+        self.assertTrue(item["video"].endswith(key + ".mp4"))
+        catalog.evict(self.cat, [key])
+        self.assertFalse(Path(item["video"]).exists())
+
     def test_download_evict_restart_redownload_and_expiring_url(self):
         catalog.sync(self.cat, self.cfg, self.api)
         key = catalog.item_key(self.cat.account, "SharedSync-fabricated", "live")

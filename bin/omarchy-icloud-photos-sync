@@ -22,6 +22,8 @@ if [ "${DEMO:-0}" != 1 ] && ! { [ -f "$catalog_config" ] && grep -Eq '^DEMO=1[[:
   case "${1:-}" in
     ""|--full) exec "$catalog_python" "$script_dir/library_catalog.py" sync "$@" ;;
     --index-only) exec "$catalog_python" "$script_dir/library_catalog.py" export ;;
+    --convert) shift; exec "$catalog_python" "$script_dir/library_catalog.py" convert "$@" ;;
+    --convert-all) shift; exec "$catalog_python" "$script_dir/library_catalog.py" convert-all "$@" ;;
   esac
 fi
 
