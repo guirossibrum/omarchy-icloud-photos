@@ -67,7 +67,7 @@ Rectangle {
     anchors.right: parent.right
     anchors.bottom: parent.bottom
     anchors.margins: 8
-    visible: !!item && item.state !== undefined && (root.downloading || item.state === "failed" || item.downloaded)
+    visible: !!item && item.state !== undefined && (root.downloading || item.state === "failed")
     width: stateLabel.implicitWidth + 12
     height: 20
     radius: 4
@@ -75,7 +75,7 @@ Rectangle {
     Text {
       id: stateLabel
       anchors.centerIn: parent
-      text: item ? (root.downloading ? "Downloading" : item.state === "failed" ? "Failed" : "Downloaded") : ""
+      text: item ? (root.downloading ? "Downloading" : "Failed") : ""
       color: "white"
       font.family: theme.fontFamily
       font.pixelSize: 10
@@ -94,7 +94,7 @@ Rectangle {
     anchors.left: parent.left
     anchors.bottom: parent.bottom
     anchors.margins: 8
-    width: durationText.implicitWidth + 22
+    width: durationText.visible ? durationText.implicitWidth + 22 : 22
     height: 22
     radius: 4
     color: Qt.rgba(0, 0, 0, 0.6)
@@ -110,7 +110,8 @@ Rectangle {
       }
       Text {
         id: durationText
-        text: item ? root.fmtDuration(item.duration) : ""
+        visible: !!item && item.duration > 0
+        text: visible ? root.fmtDuration(item.duration) : ""
         color: "white"
         font.family: theme.fontFamily
         font.pixelSize: 11
@@ -193,18 +194,26 @@ Rectangle {
 
   // A cloud mark means the full original is absent. Hover replaces it with
   // the same small actions control used by iCloud Photos.
-  Rectangle {
+  Item {
     visible: !!item && item.state !== undefined && !item.downloaded && !root.checked && !tileHover.hovered
     anchors.right: parent.right; anchors.top: parent.top
     anchors.margins: 8
-    width: 24; height: 24; radius: 12
-    color: Qt.rgba(0, 0, 0, 0.55)
-    Text {
-      anchors.centerIn: parent
-      text: "\uf0c2"
-      color: "white"
-      font.family: root.theme.fontFamily
-      font.pixelSize: 14
+    width: 24; height: 24
+    Canvas {
+      anchors.fill: parent
+      onPaint: {
+        var c = getContext("2d");
+        c.clearRect(0, 0, width, height);
+        c.beginPath();
+        c.moveTo(5.5, 18.5);
+        c.bezierCurveTo(1, 18.5, 1, 11.5, 6, 10.5);
+        c.bezierCurveTo(7, 3, 17, 2, 19, 10);
+        c.bezierCurveTo(25, 11, 24, 18.5, 19, 18.5);
+        c.closePath();
+        c.lineWidth = 2;
+        c.strokeStyle = "white";
+        c.stroke();
+      }
     }
   }
   Rectangle {

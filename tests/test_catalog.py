@@ -194,6 +194,38 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(migrated.get("fabricated-key")["favorite"])
         self.assertIsNone(migrated.get("fabricated-key")["added_at"])
         self.assertIsNone(migrated.get("fabricated-key")["rank"])
+        self.assertIsNone(migrated.get("fabricated-key")["duration"])
+
+    def test_video_length_from_existing_original_and_favorite_request(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=3)
+        video = Asset("duration-video", "PrimarySync", 2, kind="video", name="fabricated.mov")
+        data = catalog.metadata(video, self.cat.account, "PrimarySync")
+        data["rank"] = 2
+        self.cat.upsert(data, 1)
+        key = data["id"]
+        original = self.cache / "originals" / key / "fabricated.mov"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(b"fabricated video")
+        self.cat.db.execute("UPDATE assets SET original=?, owned=1 WHERE id=?", (str(original), key))
+        with patch.object(catalog, "video_duration", return_value=33.2):
+            self.cat.export()
+        exported = next(it for it in json.loads((self.cache / "index.json").read_text()) if it["id"] == key)
+        self.assertEqual(exported["duration"], 33.2)
+
+        calls = []
+        class Session:
+            def post(self, url, data, headers):
+                calls.append(json.loads(data))
+                return SimpleNamespace(json=lambda: {"records": [{"recordChangeTag": "next"}]})
+        library = SimpleNamespace(service_endpoint="https://fabricated.invalid", params={},
+                                  zone_id={"zoneName": "PrimarySync"}, session=Session())
+        helper.set_asset_flag(library, "duration-video", "tag", "isFavorite", True)
+        self.assertEqual(calls[0]["operations"][0]["record"]["fields"], {"isFavorite": {"value": 1}})
+        with patch.object(helper, "CACHE", self.cache):
+            helper.cmd_favorite(SimpleNamespace(key=key, value=1), {**self.cfg, "DEMO": "1"})
+            self.assertEqual(self.cat.get(key)["favorite"], 1)
+            helper.cmd_favorite(SimpleNamespace(key=key, value=0), {**self.cfg, "DEMO": "1"})
+            self.assertEqual(self.cat.get(key)["favorite"], 0)
 
     def test_first_sync_publishes_cards_before_thumbnail_requests(self):
         exports = []
@@ -280,7 +312,7 @@ class CatalogTests(unittest.TestCase):
         def spawn(command):
             Path(command[-1]).write_bytes(b"fabricated-sdr")
             return SimpleNamespace(wait=lambda: 0, poll=lambda: 0)
-        with patch.object(catalog.subprocess, "run", return_value=SimpleNamespace(stdout="arib-std-b67")), \
+        with patch.object(catalog.subprocess, "run", return_value=SimpleNamespace(stdout="arib-std-b67,\n")), \
              patch.object(catalog.subprocess, "Popen", side_effect=spawn):
             self.assertTrue(catalog.convert_video(self.cat, key))
         index = __import__("json").loads((self.cache / "index.json").read_text())

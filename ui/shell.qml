@@ -34,6 +34,7 @@ ShellRoot {
   property string activeSection: "library"
   property string searchText: ""
   property bool sidebarOpen: true
+  property int calendarYear: new Date().getFullYear()
   property bool slideshowRunning: false
   property string prioritySignature: ""
   property int selected: -1
@@ -90,6 +91,7 @@ ShellRoot {
   property int downloadPercent: 0
   property string downloadError: ""
   property string failedDownloadId: ""
+  property bool videoPreparing: false
   property var afterDownload: null
   readonly property int gap: 8
   readonly property var current: (selected >= 0 && selected < items.length) ? items[selected] : null
@@ -228,6 +230,30 @@ ShellRoot {
     onExited: (code, status) => root.downloadFinished(code)
   }
   Process {
+    id: videoPrepare
+    property string itemId: ""
+    property bool converted: false
+    stdout: SplitParser {
+      onRead: data => {
+        try { videoPrepare.converted = JSON.parse(data).converted === true; } catch (e) {}
+      }
+    }
+    onExited: (code, status) => {
+      root.videoPreparing = false;
+      if (code !== 0) { toast.show("Could not prepare video playback", 3500); return; }
+      if (!root.current || root.current.id !== itemId) return;
+      if (converted) {
+        var updated = root.libraryItems.map(function (it) {
+          if (it.id !== videoPrepare.itemId) return it;
+          return Object.assign({}, it, { video: root.cacheDir + "/videos/" + it.id + ".mp4" });
+        });
+        root.applyIndex(JSON.stringify(updated));
+      }
+      viewer.videoShown = true;
+      indexFile.reload();
+    }
+  }
+  Process {
     id: eviction
     onExited: (code, status) => {
       indexFile.reload();
@@ -328,6 +354,16 @@ ShellRoot {
     if (originalDownload.running) originalDownload.running = false;
   }
 
+  function playVideo(it) {
+    if (!it || videoPrepare.running || originalDownload.running) return;
+    if (!it.path) { ensureOriginal(it, function () { root.playVideo(root.current); }); return; }
+    videoPreparing = true;
+    videoPrepare.itemId = it.id;
+    videoPrepare.converted = false;
+    videoPrepare.command = [catalogScript, "convert", it.id];
+    videoPrepare.running = true;
+  }
+
   function ensureMany(list, callback, at) {
     at = at || 0;
     if (at >= list.length) { callback(); return; }
@@ -344,6 +380,13 @@ ShellRoot {
   }
 
   Process { id: opener }
+  Process {
+    id: favoriteProc
+    onExited: (code, status) => {
+      indexFile.reload();
+      toast.show(code === 0 ? "Favorite updated" : "Could not update favorite", 3000);
+    }
+  }
   Process {
     id: infoProc
     property string forId: ""
@@ -484,6 +527,54 @@ ShellRoot {
     pinBottom = true;
     var list = filterItems(libraryItems);
     rebuild(list, list.length - 1);
+  }
+
+  function calendarYears() {
+    var years = {};
+    for (var i = 0; i < libraryItems.length; i++) {
+      var date = libraryItems[i].date || "";
+      if (/^\d{4}-\d{2}/.test(date)) years[Number(date.slice(0, 4))] = true;
+    }
+    return Object.keys(years).map(Number).sort(function (a, b) { return b - a; });
+  }
+
+  function monthPreview(year, month) {
+    var prefix = year + "-" + (month < 10 ? "0" : "") + month;
+    for (var i = libraryItems.length - 1; i >= 0; i--)
+      if (libraryItems[i].date && libraryItems[i].date.indexOf(prefix) === 0 && libraryItems[i].thumb)
+        return libraryItems[i].thumb;
+    return "";
+  }
+
+  function monthHasItems(year, month) {
+    var prefix = year + "-" + (month < 10 ? "0" : "") + month;
+    return libraryItems.some(function (it) { return it.date && it.date.indexOf(prefix) === 0; });
+  }
+
+  function jumpToMonth(year, month) {
+    var prefix = year + "-" + (month < 10 ? "0" : "") + month;
+    if (activeSection !== "library") selectSection("library");
+    calendarPopup.close();
+    Qt.callLater(function () { root.scrollToMonth(prefix); });
+  }
+
+  function scrollToMonth(prefix) {
+    for (var d = 0; d < days.length; d++) {
+      var first = items[days[d].indices[0]];
+      if (first && first.date && first.date.indexOf(prefix) === 0) {
+        pinBottom = false;
+        var top = grid.tileTop(d, 0);
+        if (top >= 0) grid.contentY = grid.clampY(top - 40);
+        return;
+      }
+    }
+  }
+
+  function toggleFavorite() {
+    if (!current || favoriteProc.running || current.state === undefined) return;
+    favoriteProc.command = [helperScript, "favorite", "--key", current.id,
+                            "--value", current.favorite === true ? "0" : "1"];
+    favoriteProc.running = true;
   }
 
   onSearchTextChanged: {
@@ -1095,6 +1186,104 @@ ShellRoot {
         onClosed: keys.forceActiveFocus()
       }
 
+      Popup {
+        id: calendarPopup
+        x: sidebar.width + 8
+        y: 49
+        width: 410
+        height: 440
+        padding: 0
+        modal: false
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle {
+          color: appTheme.darkBackground
+          radius: 10
+          border.color: appTheme.lighterBackground
+        }
+        Row {
+          anchors.fill: parent
+          Flickable {
+            width: 92; height: parent.height
+            clip: true
+            contentHeight: yearList.implicitHeight + 12
+            Column {
+              id: yearList
+              width: parent.width
+              topPadding: 8
+              Repeater {
+                model: root.calendarYears()
+                delegate: Rectangle {
+                  required property int modelData
+                  width: 86; height: 32; radius: 5
+                  color: root.calendarYear === modelData ? appTheme.lighterBackground : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    text: modelData
+                    color: appTheme.brightForeground
+                    font.family: appTheme.fontFamily
+                    font.pixelSize: appTheme.fontSize
+                  }
+                  MouseArea { anchors.fill: parent; onClicked: root.calendarYear = modelData }
+                }
+              }
+            }
+          }
+          Rectangle { width: 1; height: parent.height; color: appTheme.lighterBackground }
+          Column {
+            width: parent.width - 93
+            topPadding: 14
+            leftPadding: 14
+            spacing: 10
+            Text {
+              text: root.calendarYear
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: 19
+              font.bold: true
+            }
+            Grid {
+              columns: 3
+              spacing: 8
+              Repeater {
+                model: 12
+                delegate: Rectangle {
+                  required property int index
+                  readonly property int month: index + 1
+                  readonly property bool available: root.monthHasItems(root.calendarYear, month)
+                  readonly property string poster: root.monthPreview(root.calendarYear, month)
+                  width: 88; height: 82; radius: 6
+                  color: appTheme.background
+                  opacity: available ? 1 : 0.35
+                  Image {
+                    anchors.fill: parent
+                    source: poster ? "file://" + poster : ""
+                    fillMode: Image.PreserveAspectCrop
+                    asynchronous: true
+                  }
+                  Rectangle {
+                    anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+                    height: 25; color: Qt.rgba(0, 0, 0, 0.65)
+                    Text {
+                      anchors.centerIn: parent
+                      text: Qt.locale("en_US").monthName(month - 1, Locale.ShortFormat)
+                      color: "white"
+                      font.family: appTheme.fontFamily
+                      font.pixelSize: 13
+                    }
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    enabled: available
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.jumpToMonth(root.calendarYear, month)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
       Keys.onPressed: event => {
         var k = event.key;
         var t = event.text;
@@ -1172,8 +1361,9 @@ ShellRoot {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.bottom: parent.bottom
-        width: root.sidebarOpen && !root.needLogin ? 228 : 0
-        visible: width > 0
+        width: root.needLogin ? 0 : (root.sidebarOpen ? 228 : 42)
+        visible: !root.needLogin
+        expanded: root.sidebarOpen
         theme: appTheme
         section: root.activeSection
         onSectionSelected: section => root.selectSection(section)
@@ -1195,27 +1385,12 @@ ShellRoot {
           anchors.verticalCenter: parent.verticalCenter
           spacing: 4
           ActionIcon {
-            theme: appTheme; icon: "\uf0db"; hint: "Toggle sidebar (Ctrl+B)"
-            onActivated: root.sidebarOpen = !root.sidebarOpen
-          }
-          ActionIcon {
-            theme: appTheme; icon: "\uf00a"; hint: "Photo grid"
-            onActivated: root.viewerOpen = false
-          }
-          ActionIcon {
-            theme: appTheme; icon: "\uf068"; hint: "Smaller thumbnails"
-            onActivated: root.setCell(root.cell - 24)
-          }
-          Slider {
-            id: toolbarZoom
-            anchors.verticalCenter: parent.verticalCenter
-            width: 82; from: 100; to: 400; stepSize: 4
-            value: root.cell
-            onMoved: root.setCell(value)
-          }
-          ActionIcon {
-            theme: appTheme; icon: "\uf067"; hint: "Larger thumbnails"
-            onActivated: root.setCell(root.cell + 24)
+            theme: appTheme; icon: "\uf073"; hint: "Jump to month"
+            onActivated: {
+              var years = root.calendarYears();
+              if (years.length && years.indexOf(root.calendarYear) < 0) root.calendarYear = years[0];
+              calendarPopup.open();
+            }
           }
         }
 
@@ -1225,7 +1400,7 @@ ShellRoot {
           anchors.verticalCenter: parent.verticalCenter
           spacing: 3
           ActionIcon {
-            theme: appTheme; icon: "\uf0ed"; hint: "Sync library"
+            theme: appTheme; icon: "\uf0ed"; hint: "Refresh catalog from iCloud"
             onActivated: root.startSync()
           }
           ActionIcon {
@@ -1234,8 +1409,10 @@ ShellRoot {
             onActivated: root.saveToDownloads()
           }
           ActionIcon {
-            theme: appTheme; icon: "\uf004"; hint: "Show Favorites"
-            onActivated: root.selectSection("favorites")
+            theme: appTheme; icon: root.current && root.current.favorite === true ? "\uf004" : "\uf08a"
+            hint: root.current && root.current.favorite === true ? "Remove from Favorites" : "Add to Favorites"
+            available: root.current !== null && root.current.state !== undefined && !favoriteProc.running
+            onActivated: root.toggleFavorite()
           }
           ActionIcon {
             theme: appTheme; icon: "\uf019"; hint: "Download original"
@@ -1808,6 +1985,7 @@ ShellRoot {
         theme: appTheme
         item: root.viewerOpen ? root.current : null
         downloadState: root.current && root.current.id === root.downloadingId ? "downloading" :
+                       root.current && root.videoPreparing && root.current.id === videoPrepare.itemId ? "preparing" :
                        root.current && !root.current.downloaded &&
                        (root.current.id === root.failedDownloadId || root.current.state === "failed") ? "failed" : ""
         downloadMessage: root.downloadError || (root.current ? (root.current.error || "") : "")
@@ -1821,10 +1999,13 @@ ShellRoot {
         onRequestCopyPath: root.copyPath()
         onRequestSave: root.saveToDownloads()
         onRequestDownload: if (root.current) root.ensureOriginal(root.current)
-        onRequestRetry: if (root.current) root.ensureOriginal(root.current, null, root.downloadingComponent === "motion" ? "motion" : "original")
+        onRequestRetry: if (root.current) {
+          if (root.current.kind === "video") root.playVideo(root.current);
+          else root.ensureOriginal(root.current, null, root.downloadingComponent === "motion" ? "motion" : "original");
+        }
         onRequestCancel: root.cancelDownload()
         onRequestMotion: if (root.current) root.ensureOriginal(root.current, function () { viewer.playLive(); }, "motion")
-        onRequestVideo: if (root.current) root.ensureOriginal(root.current, function () { viewer.videoShown = true; })
+        onRequestVideo: if (root.current) root.playVideo(root.current)
         onContextMenuRequested: (x, y) => root.showCopyMenu(viewer, x, y, -1)
       }
 

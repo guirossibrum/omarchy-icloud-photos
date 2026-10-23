@@ -4,6 +4,7 @@ Rectangle {
   id: root
   required property var theme
   property string section: "library"
+  property bool expanded: true
   property bool mediaExpanded: true
   signal sectionSelected(string section)
   signal toggleRequested()
@@ -48,6 +49,7 @@ Rectangle {
   }
 
   Flickable {
+    visible: root.expanded
     anchors.top: toggle.bottom
     anchors.topMargin: 13
     anchors.left: parent.left

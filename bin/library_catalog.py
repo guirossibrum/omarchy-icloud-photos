@@ -102,7 +102,7 @@ class Catalog:
               record TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
               captured TEXT, ts REAL, width INTEGER, height INTEGER,
               timezone TEXT, location TEXT, camera TEXT, size INTEGER, thumb TEXT,
-              added_at REAL, favorite INTEGER, rank INTEGER,
+              added_at REAL, favorite INTEGER, rank INTEGER, duration REAL,
               original TEXT, motion TEXT, owned INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL DEFAULT 'cloud-only', error TEXT,
               seen INTEGER NOT NULL DEFAULT 0,
@@ -113,7 +113,8 @@ class Catalog:
               PRIMARY KEY(account, zone));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(assets)")}
-        for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER"), ("rank", "INTEGER")):
+        for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER"),
+                           ("rank", "INTEGER"), ("duration", "REAL")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE assets ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -147,6 +148,10 @@ class Catalog:
         for row in self.db.execute("SELECT * FROM assets WHERE account=? AND state NOT IN ('deleted','absent') ORDER BY ts, id", (self.account,)):
             r = dict(row)
             original = r["original"] if r["original"] and Path(r["original"]).is_file() else ""
+            if r["kind"] == "video" and original and r["duration"] is None:
+                r["duration"] = video_duration(original)
+                if r["duration"] is not None:
+                    self.db.execute("UPDATE assets SET duration=? WHERE id=?", (r["duration"], r["id"]))
             motion = r["motion"] if r["motion"] and Path(r["motion"]).is_file() else ""
             thumb = r["thumb"] if r["thumb"] and Path(r["thumb"]).is_file() else ""
             derived = self.cache / "previews" / (r["id"] + ".jpg")
@@ -160,7 +165,7 @@ class Catalog:
                 time=local.strftime("%H:%M") if local else "",
                 thumb=thumb, preview=str(derived) if original and derived.is_file() else (original or thumb), path=original,
                 video=(str(sdr) if sdr.is_file() else original) if r["kind"] == "video" else motion,
-                shared=r["zone"] != "PrimarySync", duration=0,
+                shared=r["zone"] != "PrimarySync", duration=r["duration"] or 0,
                 width=r["width"], height=r["height"], location=json.loads(r["location"]) if r["location"] else None,
                 camera=r["camera"], size=r["size"], downloaded=bool(original),
                 addedAt=r["added_at"], favorite=bool(r["favorite"]) if r["favorite"] is not None else None,
@@ -168,7 +173,19 @@ class Catalog:
                 state=("downloaded" if original else "cloud-only") if r["state"] != "failed" else "failed",
                 error=r["error"] or ""))
         atomic_json(self.cache / "index.json", items)
+        self.db.commit()
         return len(items)
+
+
+def video_duration(path):
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "csv=p=0", str(path)], capture_output=True, text=True,
+                                check=True, timeout=15)
+        value = float(result.stdout.strip())
+        return value if value > 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def atomic_json(path, value):
@@ -365,6 +382,8 @@ def _download(cat, cfg, key, component="original", api=None):
             with cat.db:
                 cat.db.execute(f"UPDATE assets SET {column}=?, owned=1, state='downloaded', error=NULL WHERE id=?",
                                (str(dest), key))
+                if component == "original" and row["kind"] == "video":
+                    cat.db.execute("UPDATE assets SET duration=? WHERE id=?", (video_duration(dest), key))
             cat.export()
             print(json.dumps(dict(state="downloaded", id=key, path=str(dest))), flush=True)
             return str(dest)
@@ -422,7 +441,9 @@ def convert_video(cat, key):
         probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                                 "-show_entries", "stream=color_transfer", "-of", "csv=p=0", source],
                                capture_output=True, text=True, check=True)
-        if probe.stdout.strip() not in ("arib-std-b67", "smpte2084"):
+        # ffprobe appends a CSV comma when a stream has Dolby Vision side
+        # data; compare the actual transfer token rather than the whole row.
+        if probe.stdout.strip().split(",", 1)[0] not in ("arib-std-b67", "smpte2084"):
             return False
         dest = cat.cache / "videos" / (key + ".mp4")
         if dest.is_file() and dest.stat().st_mtime >= Path(source).stat().st_mtime:
@@ -682,7 +703,8 @@ def main():
             download(cat, cfg, args.id, args.component)
         elif args.command == "convert":
             for key in args.ids:
-                convert_video(cat, key)
+                changed = convert_video(cat, key)
+                print(json.dumps({"id": key, "converted": changed}), flush=True)
         elif args.command == "convert-all":
             if not args.force and not on_ac():
                 raise RuntimeError("plug in or pass --force to convert all videos")

@@ -149,14 +149,18 @@ def describe(asset):
 
 
 def set_deleted(library, record_name, change_tag, deleted):
+    return set_asset_flag(library, record_name, change_tag, "isDeleted", deleted)
+
+
+def set_asset_flag(library, record_name, change_tag, field_name, enabled):
     url = f"{library.service_endpoint}/records/modify?{urllib.parse.urlencode(library.params)}"
     body = {
         "atomic": True,
-        "desiredKeys": ["isDeleted"],
+        "desiredKeys": [field_name],
         "operations": [{
             "operationType": "update",
             "record": {
-                "fields": {"isDeleted": {"value": 1 if deleted else 0}},
+                "fields": {field_name: {"value": 1 if enabled else 0}},
                 "recordChangeTag": change_tag,
                 "recordName": record_name,
                 "recordType": "CPLAsset",
@@ -170,6 +174,23 @@ def set_deleted(library, record_name, change_tag, deleted):
     if not records or "serverErrorCode" in records[0]:
         fail("iCloud refused the change", response=data)
     return records[0].get("recordChangeTag", change_tag)
+
+
+def cmd_favorite(args, cfg):
+    from library_catalog import Catalog, account_key, libraries, matching_asset
+    cat = Catalog(CACHE, account_key(cfg["APPLE_ID"]))
+    row = cat.get(args.key)
+    if not demo(cfg):
+        api = connect(cfg)
+        library = dict(libraries(api))[row["zone"]]
+        asset = matching_asset(library, row["record"])
+        set_asset_flag(library, row["record"], asset._asset_record["recordChangeTag"],
+                       "isFavorite", args.value == 1)
+    with cat.db:
+        cat.db.execute("UPDATE assets SET favorite=? WHERE id=? AND account=?",
+                       (args.value, args.key, cat.account))
+    cat.export()
+    print(json.dumps({"ok": True, "favorite": bool(args.value)}))
 
 
 def demo(cfg):
@@ -321,9 +342,12 @@ def main():
     d.add_argument("--ts", type=int); d.add_argument("--companion"); d.add_argument("--shared", action="store_true")
     d.add_argument("--record"); d.add_argument("--zone")
     r = sub.add_parser("restore"); r.add_argument("--key", required=True)
+    fav = sub.add_parser("favorite"); fav.add_argument("--key", required=True)
+    fav.add_argument("--value", type=int, choices=(0, 1), required=True)
     args = p.parse_args()
     cfg = read_config(require_id=args.cmd != "login")
-    {"login": cmd_login, "find": cmd_find, "delete": cmd_delete, "restore": cmd_restore}[args.cmd](args, cfg)
+    {"login": cmd_login, "find": cmd_find, "delete": cmd_delete,
+     "restore": cmd_restore, "favorite": cmd_favorite}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

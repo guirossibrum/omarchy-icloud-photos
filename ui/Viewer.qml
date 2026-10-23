@@ -54,8 +54,7 @@ Rectangle {
       return;
     }
     if (item.kind !== "video") return;
-    if (!item.video) { requestVideo(); return; }
-    if (!videoShown) { videoShown = true; return; }
+    if (!videoShown) { requestVideo(); return; }
     if (playing) video.pause(); else video.play();
   }
 
@@ -140,7 +139,7 @@ Rectangle {
 
   Rectangle {
     anchors.centerIn: frame
-    visible: item && item.kind === "video" && !root.videoShown && downloadState !== "downloading"
+    visible: item && item.kind === "video" && !root.videoShown && downloadState !== "downloading" && downloadState !== "preparing"
     width: 56; height: 56; radius: 28
     color: Qt.rgba(0, 0, 0, 0.72)
     Text {
@@ -160,7 +159,7 @@ Rectangle {
   Rectangle {
     anchors.centerIn: frame
     z: 10
-    visible: item && (downloadState === "downloading" || downloadState === "failed")
+    visible: item && item.kind !== "video" && (downloadState === "downloading" || downloadState === "failed")
     width: 270; height: 108; radius: 8
     color: theme.darkBackground
     border.color: theme.lighterBackground
@@ -186,6 +185,32 @@ Rectangle {
           onClicked: downloadState === "downloading" ? root.requestCancel() : root.requestRetry()
         }
       }
+    }
+  }
+
+  Rectangle {
+    anchors.horizontalCenter: frame.horizontalCenter
+    anchors.bottom: frame.bottom
+    anchors.bottomMargin: 12
+    z: 11
+    visible: item && item.kind === "video" && !root.videoShown && downloadState !== ""
+    width: videoStatus.implicitWidth + 30
+    height: 34; radius: 7
+    color: Qt.rgba(0, 0, 0, 0.72)
+    Text {
+      id: videoStatus
+      anchors.centerIn: parent
+      text: downloadState === "downloading" ? "Downloading video " + downloadPercent + "%  ·  Cancel" :
+            downloadState === "preparing" ? "Preparing HDR playback…" : "Download failed  ·  Retry"
+      color: theme.brightForeground
+      font.family: theme.fontFamily
+      font.pixelSize: theme.fontSize - 1
+    }
+    MouseArea {
+      anchors.fill: parent
+      enabled: downloadState !== "preparing"
+      cursorShape: Qt.PointingHandCursor
+      onClicked: downloadState === "downloading" ? root.requestCancel() : root.requestRetry()
     }
   }
 
