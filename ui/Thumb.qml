@@ -31,7 +31,7 @@ Rectangle {
     id: thumbnail
     anchors.fill: parent
     anchors.margins: (root.selected || root.checked) ? 3 : 0
-    source: item ? "file://" + item.thumb : ""
+    source: item && item.thumb ? "file://" + item.thumb : ""
     asynchronous: true
     fillMode: Image.PreserveAspectCrop
     sourceSize.width: 400

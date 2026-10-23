@@ -9,24 +9,27 @@ Rectangle {
 
   required property var theme
   property var item: null
-  // Whether the moving picture is on screen: always for a video, toggled
-  // for a Live Photo.
+  // A cloud-only video shows its poster until Play requests the full file.
   property bool videoShown: false
+  property string shownId: ""
   property string downloadState: ""
   property string downloadMessage: ""
+  property string downloadComponent: "original"
   property int downloadPercent: 0
   readonly property bool playing: video.playbackState === MediaPlayer.PlayingState
-  readonly property bool hasVideo: item !== null && !!item.video
+  readonly property string previewPath: item ? (item.kind === "video" ? (item.thumb || "") : (item.preview || item.thumb || "")) : ""
 
   signal requestClose()
   signal requestNext()
   signal requestPrev()
   signal requestCopyPath()
   signal requestSave()
+  signal requestDownload()
   signal requestInfo()
   signal requestRetry()
   signal requestCancel()
   signal requestMotion()
+  signal requestVideo()
   signal contextMenuRequested(real x, real y)
 
   // Details panel: rows of [label, value] from the info script.
@@ -38,16 +41,21 @@ Rectangle {
   focus: false
 
   onItemChanged: {
-    videoShown = item !== null && item.kind === "video";
+    var nextId = item ? item.id : "";
+    if (nextId !== shownId) videoShown = false;
+    shownId = nextId;
   }
 
   // Space: pause or resume a video; for a Live Photo, play the clip once.
   function togglePlay() {
-    if (!hasVideo) return;
+    if (!item) return;
     if (item.kind === "live") {
       playLive();
       return;
     }
+    if (item.kind !== "video") return;
+    if (!item.video) { requestVideo(); return; }
+    if (!videoShown) { videoShown = true; return; }
     if (playing) video.pause(); else video.play();
   }
 
@@ -101,7 +109,7 @@ Rectangle {
   Image {
     id: still
     anchors.fill: frame
-    source: (item && item.kind !== "video") ? "file://" + item.preview : ""
+    source: root.previewPath ? "file://" + root.previewPath : ""
     fillMode: Image.PreserveAspectFit
     asynchronous: true
     autoTransform: true
@@ -121,10 +129,38 @@ Rectangle {
     font.pixelSize: 28
   }
 
+  Text {
+    anchors.centerIn: still
+    visible: !root.videoShown && still.status !== Image.Ready && still.status !== Image.Loading
+    text: "No preview available"
+    color: theme.darkForeground
+    font.family: theme.fontFamily
+    font.pixelSize: theme.fontSize
+  }
+
+  Rectangle {
+    anchors.centerIn: frame
+    visible: item && item.kind === "video" && !root.videoShown && downloadState !== "downloading"
+    width: 56; height: 56; radius: 28
+    color: Qt.rgba(0, 0, 0, 0.72)
+    Text {
+      anchors.centerIn: parent
+      text: ""
+      color: "white"
+      font.family: theme.fontFamily
+      font.pixelSize: 20
+    }
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.togglePlay()
+    }
+  }
+
   Rectangle {
     anchors.centerIn: frame
     z: 10
-    visible: item && (downloadState === "downloading" || downloadState === "failed" || (!item.downloaded && item.state === "cloud-only"))
+    visible: item && (downloadState === "downloading" || downloadState === "failed")
     width: 270; height: 108; radius: 8
     color: theme.darkBackground
     border.color: theme.lighterBackground
@@ -132,8 +168,8 @@ Rectangle {
       anchors.centerIn: parent
       spacing: 12
       Text {
-        text: downloadState === "downloading" ? "Downloading original…" + (downloadPercent > 0 ? " " + downloadPercent + "%" : "") :
-              downloadState === "failed" ? (downloadMessage || "Download failed") : "Original in iCloud"
+        text: downloadState === "downloading" ? "Downloading " + (downloadComponent === "motion" ? "Live Photo motion" : item && item.kind === "video" ? "video" : "original") + "…" + (downloadPercent > 0 ? " " + downloadPercent + "%" : "") :
+              (downloadMessage || "Download failed")
         color: theme.brightForeground
         font.family: theme.fontFamily
         width: 250
@@ -194,7 +230,9 @@ Rectangle {
       MouseArea {
         anchors.fill: parent
         hoverEnabled: true
-        onEntered: root.playLive()
+        // Hover only plays motion already cached locally. Click or Space
+        // explicitly requests a missing motion component.
+        onEntered: if (item && item.video) root.playLive()
         onClicked: root.playLive()
       }
     }
@@ -464,7 +502,7 @@ Rectangle {
         }
       }
 
-      // Download: a copy of the original lands in ~/Downloads.
+      // Export a separate copy to ~/Downloads when requested.
       Rectangle {
         anchors.verticalCenter: parent.verticalCenter
         width: saveLabel.implicitWidth + 24
@@ -486,7 +524,7 @@ Rectangle {
           }
           Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: "Download"
+            text: "Save copy"
             color: theme.foreground
             font.family: theme.fontFamily
             font.pixelSize: theme.fontSize - 1
@@ -498,6 +536,35 @@ Rectangle {
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onClicked: root.requestSave()
+        }
+      }
+
+      Rectangle {
+        anchors.verticalCenter: parent.verticalCenter
+        visible: item !== null && item.state !== undefined
+        width: localLabel.implicitWidth + 24
+        height: 28
+        radius: 6
+        color: localArea.containsMouse && !item.downloaded ? theme.lighterBackground : "transparent"
+        border.color: theme.lighterBackground
+        border.width: 1
+        Text {
+          id: localLabel
+          anchors.centerIn: parent
+          text: downloadState === "downloading" ? "Cancel" :
+                item && item.downloaded ? "Downloaded" :
+                downloadState === "failed" ? "Retry download" : "Download original"
+          color: item && item.downloaded ? theme.darkForeground : theme.foreground
+          font.family: theme.fontFamily
+          font.pixelSize: theme.fontSize - 1
+        }
+        MouseArea {
+          id: localArea
+          anchors.fill: parent
+          enabled: item && (!item.downloaded || downloadState === "downloading")
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: downloadState === "downloading" ? root.requestCancel() : root.requestDownload()
         }
       }
     }

@@ -52,6 +52,7 @@ ShellRoot {
   // Apple ID from the config file; empty until the first sign-in.
   property string appleId: ""
   property bool configLoaded: false
+  property bool skipTimer: false
   // The sign-in card shows on first run and whenever the session has expired.
   readonly property bool needLogin: configLoaded && (appleId === "" || status.state === "auth-required")
   // Keep the grid scrolled to the newest items (the bottom) until the user
@@ -160,6 +161,7 @@ ShellRoot {
     printErrors: false
     onLoaded: {
       var next = root.parseAppleId(text());
+      root.skipTimer = /^\s*SKIP_TIMER=1\s*$/m.test(text());
       if (root.appleId && next !== root.appleId) { root.rebuild([], -1); root.startSync(); }
       root.appleId = next;
       root.configLoaded = true;
@@ -259,8 +261,6 @@ ShellRoot {
       toast.show(downloadError, 6000);
     }
     indexFile.reload();
-    if (viewerOpen && current && current.id !== id && current.state === "cloud-only" && !originalDownload.running)
-      ensureOriginal(current);
   }
 
   function ensureOriginal(it, callback, component) {
@@ -461,7 +461,7 @@ ShellRoot {
       toast.show("Signed in as " + msg.username);
       keys.forceActiveFocus();
       startSync();
-      timerEnabler.running = true;
+      if (!root.skipTimer && Quickshell.env("OMARCHY_ICLOUD_PHOTOS_SKIP_TIMER") !== "1") timerEnabler.running = true;
     } else if (msg.error) {
       loginCard.busy = false;
       loginCard.error = msg.error;
@@ -694,12 +694,9 @@ ShellRoot {
   onCurrentChanged: {
     if (infoOpen && viewerOpen) fetchInfo();
     if (current && current.id !== failedDownloadId && !originalDownload.running) downloadError = "";
-    if (viewerOpen && current && current.state === "cloud-only" && !current.downloaded && !originalDownload.running && current.id !== failedDownloadId)
-      ensureOriginal(current);
   }
   onViewerOpenChanged: {
     if (!viewerOpen) infoOpen = false;
-    else if (current && current.state !== undefined && !current.downloaded) ensureOriginal(current);
   }
 
   function copyPath() {
@@ -1551,8 +1548,10 @@ ShellRoot {
         theme: appTheme
         item: root.viewerOpen ? root.current : null
         downloadState: root.current && root.current.id === root.downloadingId ? "downloading" :
-                       root.current && root.current.state === "failed" ? "failed" : ""
+                       root.current && !root.current.downloaded &&
+                       (root.current.id === root.failedDownloadId || root.current.state === "failed") ? "failed" : ""
         downloadMessage: root.downloadError || (root.current ? root.current.error : "")
+        downloadComponent: root.downloadingComponent
         downloadPercent: root.downloadPercent
         infoOpen: root.infoOpen
         infoRows: (root.current && root.infoForId === root.current.id) ? root.infoRows : []
@@ -1561,9 +1560,11 @@ ShellRoot {
         onRequestPrev: root.move(-1)
         onRequestCopyPath: root.copyPath()
         onRequestSave: root.saveToDownloads()
-        onRequestRetry: if (root.current) root.ensureOriginal(root.current)
+        onRequestDownload: if (root.current) root.ensureOriginal(root.current)
+        onRequestRetry: if (root.current) root.ensureOriginal(root.current, null, root.downloadingComponent === "motion" ? "motion" : "original")
         onRequestCancel: root.cancelDownload()
         onRequestMotion: if (root.current) root.ensureOriginal(root.current, function () { viewer.playLive(); }, "motion")
+        onRequestVideo: if (root.current) root.ensureOriginal(root.current, function () { viewer.videoShown = true; })
         onContextMenuRequested: (x, y) => root.showCopyMenu(viewer, x, y, -1)
       }
 

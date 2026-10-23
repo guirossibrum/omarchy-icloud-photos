@@ -112,6 +112,9 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(self.cat.get(catalog.item_key(self.cat.account, "PrimarySync", "p649"))["ts"] < 1700000000 - 30 * 86400)
         self.assertNotEqual(catalog.item_key(self.cat.account, "PrimarySync", "p0"),
                             catalog.item_key(self.cat.account, "SharedSync-fabricated", "p0"))
+        video = self.cat.get(catalog.item_key(self.cat.account, "SharedSync-fabricated", "p0"))
+        self.assertEqual(Path(video["thumb"]).read_bytes(), b"thumb")
+        self.assertIsNone(video["original"])
         calls = self.personal.session.calls + self.shared.session.calls
         self.assertTrue(calls)
         self.assertTrue(all(url.startswith("thumb:") for url in calls))

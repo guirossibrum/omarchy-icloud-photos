@@ -24,10 +24,11 @@ subprocess.run(["magick", "-size", "64x64", "xc:steelblue", str(thumb)], check=T
 items = []
 for i in range(750):
     date = datetime(2023, 1, 1, tzinfo=timezone.utc) + timedelta(days=i // 10, hours=i % 10)
+    kind = "video" if i in (748, 749) else "live" if i == 747 else "photo"
     items.append(dict(id=f"fabricated-{i:04}", record=f"record-{i:04}", zone="PrimarySync",
-                      name=f"fabricated-{i:04}.jpg", kind="photo", ts=date.timestamp(),
+                      name=f"fabricated-{i:04}.{'mov' if kind == 'video' else 'jpg'}", kind=kind, ts=date.timestamp(),
                       captured=date.isoformat(), date=date.strftime("%Y-%m-%d"), time=date.strftime("%H:%M"),
-                      thumb=str(thumb), preview=str(thumb), path="", video="", shared=False,
+                      thumb="" if i == 748 else str(thumb), preview="" if i == 748 else str(thumb), path="", video="", shared=False,
                       duration=0, downloaded=False, state="cloud-only", error=""))
 (cache / "index.json").write_text(json.dumps(items))
 (cache / "status.json").write_text(json.dumps(dict(state="ok", message="", count=len(items),

@@ -45,19 +45,20 @@ Then start `omarchy-icloud-photos`, or pick "Omarchy iCloud Photos" in the launc
 
 ## Why
 
-Apple does not make an iCloud Photos client for Linux. This app keeps a local catalog and thumbnails for the accessible library, then downloads original media when you open or use an item. The Quickshell window shows the library by day, newest at the bottom, in your Omarchy theme.
+Apple does not make an iCloud Photos client for Linux. This app keeps a local catalog and thumbnails for the accessible library, then downloads original media when you request it or an action requires it. The Quickshell window shows the library by day, newest at the bottom, in your Omarchy theme.
 
 ![The grid: a week of photos and videos grouped by day, in the Tokyo Night theme](assets/screenshot.jpg)
 
 ## What it does
 
 - **Grid by day.** Photos, videos and Live Photos from the full accessible library, grouped by day with the newest at the bottom. Thumbnails scale with a slider. A missing thumbnail gets a placeholder.
+- **Preview first.** Opening an item shows its cached thumbnail or video poster without downloading full media. The viewer's bottom-right **Download original** button stores a local copy; **Save copy** exports to `~/Downloads`. Playing a cloud-only video or clicking a cloud-only Live Photo's motion control requests that component when needed.
 - **Shared Library too.** Accessible Shared Library zones appear in the same grid with a person mark. Each catalog identity includes its account and zone, so duplicate filenames and record IDs stay distinct.
-- **Originals on demand.** Opening, playing, saving, or opening externally downloads the required original once. Live Photo motion is a separate download. The viewer shows progress, cancellation, failure and retry.
+- **Originals on demand.** The viewer opens cached previews first. Downloading, playing, saving, or opening externally fetches the required original once. Live Photo motion is a separate download. The viewer shows progress, cancellation, failure and retry.
 - **Local eviction.** `e` or the context menu's “Remove local download — keep in iCloud” action removes app-owned full media for one item or a selection while keeping its catalog entry and thumbnail. `d` remains the separate, confirmed cloud Recently Deleted action.
 - **Viewer.** Full-window stills, video with a timeline, and Live Photo motion on request. `i` shows available details. Missing cloud metadata stays unknown.
 - **Delete with undo.** `d` moves an item, or a selection, to iCloud's Recently Deleted, the same 30-day bin the Photos app uses. Undo brings it back, from the toast or with `u`. Nothing here can empty that bin.
-- **Copy and save.** `Ctrl+C`, `y`, or right-click → Copy puts the image on the clipboard as PNG from either the grid or the viewer, including for HEIC originals, so browsers can paste it as an image. Multiple selections in the grid copy as a list of files in their original image formats; the viewer copies only the opened image. Right-clicking a selected photo keeps the selection, while right-clicking another photo selects that one. `s` and the Download button save a copy to `~/Downloads` as JPEG or MP4, whatever the original was. Clicking the filename copies its full path.
+- **Copy and save.** `Ctrl+C`, `y`, or right-click → Copy puts the image on the clipboard as PNG from either the grid or the viewer, including for HEIC originals, so browsers can paste it as an image. Multiple selections in the grid copy as a list of files in their original image formats; the viewer copies only the opened image. Right-clicking a selected photo keeps the selection, while right-clicking another photo selects that one. `s` and **Save copy** put a copy in `~/Downloads` as JPEG or MP4, whatever the original was. Clicking the filename copies its full path.
 - **Signs in by itself.** Apple ID, password and the two-factor code go into the window on first run and whenever the session expires. The password is only used to open the session and is never stored.
 - **Wallpaper.** `W` makes the current photo the Omarchy background, HEIC included.
 - **Stays in sync.** A systemd user timer pulls new items every 30 minutes. An open window picks them up on its own.
@@ -144,6 +145,7 @@ A click selects, a second click on the selected item opens it. Hovering does not
 | `SHARED_LIBRARY` | `auto` | `auto` syncs the Shared Library your account is in, `no` leaves it out, a `SharedSync-…` name from `icloudpd --list-libraries` picks one |
 | `COOKIES` | `~/.config/icloudpd` | Where the iCloud session lives |
 | `XDG_CACHE_HOME` | `~/.cache` | The app uses its `omarchy-icloud-photos` subdirectory for SQLite, thumbnails, derived previews and app-owned originals |
+| `SKIP_TIMER` | unset | Set to `1` to keep a manual or isolated test session from enabling the user sync timer after sign-in |
 | `LAUNCHER_NAME` | `Omarchy iCloud Photos` | What the app is called in the launcher; re-run `install.sh` after changing it |
 
 The first sync pages through every accessible asset and can take time for a large library. It publishes the first cards after 30 records, then in growing batches or after five seconds. Cards initially show placeholders; a second pass fills in thumbnails without blocking catalog discovery. Routine syncs scan the newest records, with a complete reconciliation at least weekly or on `omarchy-icloud-photos-sync --full`. An interrupted initial scan starts again safely; completed catalog rows and thumbnails remain. Original files are fetched only by explicit item actions.
@@ -166,7 +168,7 @@ The catalog publishes `index.json` and `status.json` for Quickshell. Initial cat
 
 An HDR video can be converted to an app-owned SDR playback copy after its original is downloaded with `omarchy-icloud-photos-sync --convert ID`, or `--convert-all` for downloaded videos. The latter waits for AC power unless passed `--force`. Conversion updates the catalog index and does not scan the backup folders.
 
-The catalog uses the album, version and authenticated download interfaces in the installed `icloudpd` 1.32.3 pyicloud package. It does not require a new dependency. iCloud's private API can change; a video without an exposed JPEG poster intentionally remains a placeholder in the grid until its original is opened.
+The catalog uses the album, version and authenticated download interfaces in the installed `icloudpd` 1.32.3 pyicloud package. It does not require a new dependency. iCloud's private API can change; a video without an exposed JPEG poster intentionally remains a placeholder until its full media is downloaded for playback.
 
 The legacy demo indexer still recognizes both `X_HEVC.MOV` beside a still and a plain `X.MOV` beside a JPEG still for Live Photos. One-time adoption of existing backup originals follows the same pairing rules.
 

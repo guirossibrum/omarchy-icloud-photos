@@ -48,7 +48,7 @@ Rectangle {
         anchors.horizontalCenter: parent.horizontalCenter
         width: 200
         height: 200
-        source: item ? "file://" + item.thumb : ""
+        source: item && item.thumb ? "file://" + item.thumb : ""
         fillMode: Image.PreserveAspectCrop
         asynchronous: true
       }
@@ -61,7 +61,7 @@ Rectangle {
           delegate: Image {
             required property int index
             width: 68; height: 68
-            source: "file://" + root.items[index].thumb
+            source: root.items[index].thumb ? "file://" + root.items[index].thumb : ""
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
           }
