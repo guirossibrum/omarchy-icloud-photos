@@ -235,6 +235,20 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(original.is_file())
         self.assertEqual(self.cat.get(key)["original"], str(original))
 
+    def test_legacy_jpeg_live_photo_plain_mov_is_recognized(self):
+        still = Path(self.cfg["LIBRARY"]) / "shared" / "2021" / "09" / "same.jpg"
+        motion = still.with_suffix(".MOV")
+        still.parent.mkdir(parents=True)
+        still.write_bytes(b"legacy-still")
+        motion.write_bytes(b"legacy-motion")
+        import os
+        ts = 1700000000 - 800 * 86400
+        os.utime(still, (ts, ts))
+        catalog.sync(self.cat, self.cfg, self.api)
+        key = catalog.item_key(self.cat.account, "SharedSync-fabricated", "live")
+        self.assertEqual(self.cat.get(key)["original"], str(still))
+        self.assertEqual(self.cat.get(key)["motion"], str(motion))
+
     def test_eviction_waits_for_inflight_download_and_rejects_external_path(self):
         catalog.sync(self.cat, self.cfg, self.api)
         key = catalog.item_key(self.cat.account, "PrimarySync", "p0")

@@ -456,9 +456,13 @@ def adopt_legacy(cat, cfg):
         if len(matches) == 1:
             motion = None
             if row["kind"] == "live":
-                companion = matches[0].with_name(matches[0].stem + "_HEVC.MOV")
-                if companion.is_file() and not companion.is_symlink():
-                    motion = str(companion)
+                possible = [matches[0].with_name(matches[0].stem + "_HEVC.MOV")]
+                if matches[0].suffix.lower() in (".jpg", ".jpeg"):
+                    possible.append(matches[0].with_suffix(".MOV"))
+                for companion in possible:
+                    if companion.is_file() and not companion.is_symlink():
+                        motion = str(companion)
+                        break
             cat.db.execute("UPDATE assets SET original=?, motion=?, state='downloaded', owned=0 WHERE id=?",
                            (str(matches[0]), motion, row["id"]))
             changed = True

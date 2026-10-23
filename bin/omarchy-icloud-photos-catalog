@@ -2,5 +2,9 @@
 set -euo pipefail
 dir="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 python="$dir/.venv/bin/python"
-if [ ! -x "$python" ]; then python=python3; fi
+if [ ! -x "$python" ]; then
+  [ -d "$dir/lib" ] || { echo 'run install.sh first: .venv is missing' >&2; exit 1; }
+  export PYTHONPATH="$dir/lib${PYTHONPATH:+:$PYTHONPATH}"
+  python=python3
+fi
 exec "$python" "$dir/bin/library_catalog.py" "$@"

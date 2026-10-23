@@ -168,6 +168,8 @@ An HDR video can be converted to an app-owned SDR playback copy after its origin
 
 The catalog uses the album, version and authenticated download interfaces in the installed `icloudpd` 1.32.3 pyicloud package. It does not require a new dependency. iCloud's private API can change; a video without an exposed JPEG poster intentionally remains a placeholder in the grid until its original is opened.
 
+The legacy demo indexer still recognizes both `X_HEVC.MOV` beside a still and a plain `X.MOV` beside a JPEG still for Live Photos. One-time adoption of existing backup originals follows the same pairing rules.
+
 `bin/icloud_helper.py` is the only code that talks to iCloud beyond downloading: it signs in, and it moves one asset at a time to Recently Deleted or back, in whichever library it came from. The Shared Library sits in the owner's private database next to the personal one and in the shared database of everyone who joined, so the helper looks in both. It runs on the pyicloud module that ships with icloudpd, in the repository's own virtualenv.
 
 ```
