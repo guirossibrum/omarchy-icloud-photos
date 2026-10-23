@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls.Basic
 
 // One square in the grid. Shows the cached thumbnail, a play badge with the
 // duration for videos, a LIVE badge for Live Photos and a person top-right
@@ -210,10 +211,17 @@ Rectangle {
       styleColor: root.theme.darkBackground
     }
     MouseArea {
+      id: favoriteArea
       anchors.fill: parent
       cursorShape: Qt.PointingHandCursor
       onClicked: root.favoriteRequested()
     }
+    ToolTip.visible: favoriteArea.containsMouse
+    ToolTip.text: item && item.favoriteSync === "local-only" ?
+                    "Saved locally; retry on refresh" :
+                  item && item.favoriteSync === "pending" ? "Syncing favorite…" :
+                  item && item.favorite === true ? "Remove from Favorites" : "Add to Favorites"
+    ToolTip.delay: 500
   }
 
   // A cloud mark means the full original is absent. Hover replaces it with

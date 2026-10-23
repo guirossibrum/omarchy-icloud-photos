@@ -25,11 +25,13 @@ non-zero on failure.
 """
 
 import argparse
+import fcntl
 import json
 import logging
 import os
 import shutil
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -149,7 +151,16 @@ def describe(asset):
 
 
 def set_deleted(library, record_name, change_tag, deleted):
-    return set_asset_flag(library, record_name, change_tag, "isDeleted", deleted)
+    try:
+        return set_asset_flag(library, record_name, change_tag, "isDeleted", deleted)
+    except CloudMutationError as exc:
+        fail("iCloud refused the change", code=exc.code)
+
+
+class CloudMutationError(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
 
 
 def set_asset_flag(library, record_name, change_tag, field_name, enabled):
@@ -172,28 +183,96 @@ def set_asset_flag(library, record_name, change_tag, field_name, enabled):
     data = r.json()
     records = data.get("records") or []
     if not records or "serverErrorCode" in records[0]:
-        fail("iCloud refused the change", response=data)
+        raise CloudMutationError(records[0].get("serverErrorCode", "empty-response") if records else "empty-response")
     return records[0].get("recordChangeTag", change_tag)
 
 
-def cmd_favorite(args, cfg):
-    from library_catalog import Catalog, account_key, libraries, matching_asset
-    cat = Catalog(CACHE, account_key(cfg["APPLE_ID"]))
-    row = cat.get(args.key)
-    if not demo(cfg):
-        api = connect(cfg)
-        library = dict(libraries(api))[row["zone"]]
-        asset = matching_asset(library, row["record"])
-        # Catalog IDs use the stable CPLMaster name; isFavorite belongs to
-        # its linked CPLAsset record, which has a different record name.
-        favorite_record = asset._asset_record
-        set_asset_flag(library, favorite_record["recordName"], favorite_record["recordChangeTag"],
-                       "isFavorite", args.value == 1)
+def push_favorite(cat, row, api, attempts=3):
+    """Push a durable local choice, verifying the cloud value after mutation."""
+    from library_catalog import catalog_asset, field, libraries
+    desired = bool(row["favorite"])
+    error = "unverified"
+    tried = 0
+    for attempt in range(attempts):
+        if cat.get(row["id"])["favorite"] != row["favorite"]:
+            return False  # A newer local click superseded this request.
+        tried += 1
+        try:
+            library = dict(libraries(api))[row["zone"]]
+            asset = catalog_asset(library, row)
+            cloud_value = field(asset._asset_record, "isFavorite")
+            if cloud_value is None or bool(cloud_value) != desired:
+                # The stable catalog key points to CPLMaster; the editable
+                # favorite field belongs to its linked CPLAsset record.
+                record = asset._asset_record
+                set_asset_flag(library, record["recordName"], record["recordChangeTag"],
+                               "isFavorite", desired)
+                verified = catalog_asset(library, row)
+                actual = field(verified._asset_record, "isFavorite")
+            else:
+                actual = cloud_value  # This was already a fresh cloud read.
+            if actual is not None and bool(actual) == desired:
+                with cat.db:
+                    updated = cat.db.execute("""UPDATE assets SET favorite_sync='synced', favorite_error=NULL,
+                        favorite_attempts=favorite_attempts+? WHERE id=? AND account=? AND favorite=?""",
+                        (tried, row["id"], cat.account, int(desired)))
+                return updated.rowcount > 0
+            error = "verification-mismatch"
+        except CloudMutationError as exc:
+            error = exc.code
+            if exc.code in ("BAD_REQUEST", "PERMISSION_DENIED", "AUTHENTICATION_REQUIRED"):
+                break
+        except Exception as exc:
+            error = type(exc).__name__
+            if isinstance(exc, (PyiCloudFailedLoginException, PyiCloudServiceUnavailableException)):
+                break
+        if attempt + 1 < attempts:
+            time.sleep(min(2 ** attempt, 4))
     with cat.db:
-        cat.db.execute("UPDATE assets SET favorite=? WHERE id=? AND account=?",
-                       (args.value, args.key, cat.account))
-    cat.export()
-    print(json.dumps({"ok": True, "favorite": bool(args.value)}))
+        cat.db.execute("""UPDATE assets SET favorite_sync='local-only', favorite_error=?,
+            favorite_attempts=favorite_attempts+? WHERE id=? AND account=? AND favorite=?""",
+            (error, tried, row["id"], cat.account, int(desired)))
+    return False
+
+
+def retry_local_favorites(cat, cfg, api, limit=10):
+    with (cat.cache / "favorite.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rows = cat.db.execute("""SELECT * FROM assets WHERE account=? AND favorite_sync!='synced'
+            AND state NOT IN ('deleted','absent') ORDER BY favorite_attempts, seen DESC LIMIT ?""",
+            (cat.account, limit)).fetchall()
+        for row in rows:
+            push_favorite(cat, row, api, attempts=1)
+    if rows:
+        cat.export()
+    return len(rows)
+
+
+def cmd_favorite(args, cfg):
+    from library_catalog import Catalog, account_key
+    cat = Catalog(CACHE, account_key(cfg["APPLE_ID"]))
+    try:
+        cat.set_local_favorite(args.key, args.value)
+        if demo(cfg):
+            with cat.db:
+                cat.db.execute("UPDATE assets SET favorite_sync='synced' WHERE id=?", (args.key,))
+            cat.export()
+            print(json.dumps({"ok": True, "favorite": bool(args.value), "cloudSynced": True}))
+            return
+        try:
+            api = connect(cfg)
+            with (cat.cache / "favorite.lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                synced = push_favorite(cat, cat.get(args.key), api)
+        except (SystemExit, Exception) as exc:
+            with cat.db:
+                cat.db.execute("UPDATE assets SET favorite_sync='local-only', favorite_error=? WHERE id=?",
+                               (type(exc).__name__, args.key))
+            synced = False
+        cat.export()
+        print(json.dumps({"ok": True, "favorite": bool(args.value), "cloudSynced": synced}))
+    finally:
+        cat.db.close()
 
 
 def demo(cfg):

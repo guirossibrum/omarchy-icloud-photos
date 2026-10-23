@@ -104,7 +104,9 @@ class Catalog:
               record TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
               captured TEXT, ts REAL, width INTEGER, height INTEGER,
               timezone TEXT, location TEXT, camera TEXT, size INTEGER, thumb TEXT,
-              added_at REAL, favorite INTEGER, rank INTEGER, duration REAL,
+              added_at REAL, favorite INTEGER, favorite_sync TEXT NOT NULL DEFAULT 'synced',
+              favorite_attempts INTEGER NOT NULL DEFAULT 0, favorite_error TEXT,
+              rank INTEGER, duration REAL,
               original TEXT, motion TEXT, owned INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL DEFAULT 'cloud-only', error TEXT,
               seen INTEGER NOT NULL DEFAULT 0,
@@ -116,7 +118,10 @@ class Catalog:
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(assets)")}
         for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER"),
-                           ("rank", "INTEGER"), ("duration", "REAL")):
+                           ("favorite_sync", "TEXT NOT NULL DEFAULT 'synced'"),
+                           ("favorite_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                           ("favorite_error", "TEXT"), ("rank", "INTEGER"),
+                           ("duration", "REAL")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE assets ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -131,7 +136,12 @@ class Catalog:
             captured=excluded.captured, ts=excluded.ts, width=excluded.width,
             height=excluded.height, location=excluded.location, camera=excluded.camera,
             size=excluded.size, timezone=excluded.timezone, added_at=excluded.added_at,
-            favorite=excluded.favorite, rank=excluded.rank,
+            favorite=CASE WHEN assets.favorite_sync='synced' THEN excluded.favorite ELSE assets.favorite END,
+            favorite_sync=CASE WHEN assets.favorite_sync!='synced' AND excluded.favorite IS NOT NULL
+                                AND excluded.favorite=assets.favorite THEN 'synced' ELSE assets.favorite_sync END,
+            favorite_error=CASE WHEN assets.favorite_sync!='synced' AND excluded.favorite IS NOT NULL
+                                AND excluded.favorite=assets.favorite THEN NULL ELSE assets.favorite_error END,
+            rank=excluded.rank,
             duration=COALESCE(excluded.duration, assets.duration), seen=excluded.seen,
             state=CASE WHEN assets.state IN ('deleted','absent') THEN 'cloud-only' ELSE assets.state END""", {**data, "seen": seen})
 
@@ -140,6 +150,14 @@ class Catalog:
         if row is None:
             raise ValueError("asset is absent from this account's catalog")
         return row
+
+    def set_local_favorite(self, key, value):
+        self.get(key)
+        with self.db:
+            self.db.execute("""UPDATE assets SET favorite=?, favorite_sync='pending',
+                favorite_attempts=0, favorite_error=NULL WHERE id=? AND account=?""",
+                (int(value), key, self.account))
+        self.export()
 
     def export(self):
         with (self.cache / "index.lock").open("a+b") as lock:
@@ -172,6 +190,7 @@ class Catalog:
                 width=r["width"], height=r["height"], location=json.loads(r["location"]) if r["location"] else None,
                 camera=r["camera"], size=r["size"], downloaded=bool(original),
                 addedAt=r["added_at"], favorite=bool(r["favorite"]) if r["favorite"] is not None else None,
+                favoriteSync=r["favorite_sync"],
                 evictable=bool(original and r["owned"]),
                 state=("downloaded" if original else "cloud-only") if r["state"] != "failed" else "failed",
                 error=r["error"] or ""))
@@ -218,6 +237,18 @@ def matching_asset(library, record):
         if asset.id == record:
             return asset
     raise ValueError("asset no longer exists in the selected library")
+
+
+def catalog_asset(library, row):
+    """Use the recent rank as a shortcut, then fall back to the stable ID."""
+    if row["rank"] is not None:
+        album = newest_first(library)
+        page_size = getattr(album, "page_size", 100)
+        album.offset = row["rank"] // page_size * page_size
+        for asset in islice(album, page_size):
+            if asset.id == row["record"]:
+                return asset
+    return matching_asset(library, row["record"])
 
 
 def version(asset, component):
@@ -574,6 +605,9 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
     if changed:
         cat.export()
         changed = False
+    # Retry a bounded set before the potentially long thumbnail pass.
+    from icloud_helper import retry_local_favorites
+    retry_local_favorites(cat, cfg, api)
     status(cat.cache, "syncing", f"Loading thumbnails (0/{count})")
     fetch_visible_thumbnails(cat, libraries_by_zone)
     thumbnails = 0
@@ -668,6 +702,9 @@ def main():
     sub.add_parser("export")
     priority = sub.add_parser("prioritize")
     priority.add_argument("ids", nargs="*")
+    local_favorite = sub.add_parser("favorite-local")
+    local_favorite.add_argument("id")
+    local_favorite.add_argument("value", type=int, choices=(0, 1))
     get = sub.add_parser("download"); get.add_argument("id"); get.add_argument("--component", choices=("original", "motion"), default="original")
     remove = sub.add_parser("evict"); remove.add_argument("ids", nargs="+")
     convert = sub.add_parser("convert"); convert.add_argument("ids", nargs="+")
@@ -702,6 +739,8 @@ def main():
             # Only stable catalog keys are written. The sync resolves them
             # against the current account before any cloud request.
             atomic_json(cache / "priority.json", {"at": time.time(), "ids": args.ids[:120]})
+        elif args.command == "favorite-local":
+            cat.set_local_favorite(args.id, args.value)
         elif args.command == "download":
             download(cat, cfg, args.id, args.component)
         elif args.command == "convert":

@@ -383,16 +383,33 @@ ShellRoot {
   Process {
     id: favoriteProc
     property string assetId: ""
-    property var previousFavorite: null
     property bool requestedFavorite: false
-    onExited: (code, status) => {
-      var key = assetId, oldFavorite = previousFavorite;
-      assetId = "";
-      if (code !== 0) {
-        root.updateFavoriteInMemory(key, oldFavorite);
-        toast.show("Could not update favorite", 3000);
+    property bool cloudSynced: false
+    stdout: SplitParser {
+      onRead: data => {
+        try { favoriteProc.cloudSynced = JSON.parse(data).cloudSynced === true; }
+        catch (e) { favoriteProc.cloudSynced = false; }
       }
+    }
+    onExited: (code, status) => {
+      if (code !== 0) {
+        favoriteLocalProc.command = [catalogScript, "favorite-local", assetId,
+                                     requestedFavorite ? "1" : "0"];
+        favoriteLocalProc.running = true;
+        return;
+      }
+      assetId = "";
       indexFile.reload();
+      if (!cloudSynced) toast.show("Favorite saved locally; iCloud will retry on refresh", 4500);
+    }
+  }
+  Process {
+    id: favoriteLocalProc
+    onExited: (code, status) => {
+      favoriteProc.assetId = "";
+      if (code === 0) indexFile.reload();
+      toast.show(code === 0 ? "Favorite saved locally; iCloud will retry on refresh" :
+                 "Could not save favorite locally", 4500);
     }
   }
   Process {
@@ -583,10 +600,10 @@ ShellRoot {
 
   function toggleFavorite(item) {
     var target = item || current;
-    if (!target || favoriteProc.running || target.state === undefined) return;
+    if (!target || favoriteProc.assetId || target.state === undefined) return;
     favoriteProc.assetId = target.id;
-    favoriteProc.previousFavorite = target.favorite;
     favoriteProc.requestedFavorite = target.favorite !== true;
+    favoriteProc.cloudSynced = false;
     updateFavoriteInMemory(target.id, favoriteProc.requestedFavorite);
     favoriteProc.command = [helperScript, "favorite", "--key", target.id,
                             "--value", favoriteProc.requestedFavorite ? "1" : "0"];
@@ -1434,7 +1451,7 @@ ShellRoot {
           ActionIcon {
             theme: appTheme; icon: root.current && root.current.favorite === true ? "\uf004" : "\uf08a"
             hint: root.current && root.current.favorite === true ? "Remove from Favorites" : "Add to Favorites"
-            available: root.current !== null && root.current.state !== undefined && !favoriteProc.running
+            available: root.current !== null && root.current.state !== undefined && !favoriteProc.assetId
             onActivated: root.toggleFavorite()
           }
           ActionIcon {

@@ -197,6 +197,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(migrated.get("fabricated-key")["added_at"])
         self.assertIsNone(migrated.get("fabricated-key")["rank"])
         self.assertIsNone(migrated.get("fabricated-key")["duration"])
+        self.assertEqual(migrated.get("fabricated-key")["favorite_sync"], "synced")
 
     def test_video_length_from_existing_original_and_favorite_request(self):
         catalog.sync(self.cat, self.cfg, self.api, max_items=3)
@@ -231,11 +232,59 @@ class CatalogTests(unittest.TestCase):
 
             master_key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
             self.personal.assets[0]._asset_record["recordName"] = "linked-asset-record"
+            self.personal.assets[0]._asset_record["fields"]["isFavorite"] = {"value": 0}
+            def accept_favorite(*args):
+                self.personal.assets[0]._asset_record["fields"]["isFavorite"] = {"value": 1}
             with patch.object(helper, "connect", return_value=self.api), \
-                 patch.object(helper, "set_asset_flag") as update:
+                 patch.object(helper, "set_asset_flag", side_effect=accept_favorite) as update:
                 helper.cmd_favorite(SimpleNamespace(key=master_key, value=1), self.cfg)
             self.assertEqual(update.call_args.args[1:],
                              ("linked-asset-record", "tag", "isFavorite", True))
+            self.assertEqual(self.cat.get(master_key)["favorite_sync"], "synced")
+
+    def test_failed_favorite_remains_local_and_refresh_retries(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=3)
+        key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        asset = self.personal.assets[0]
+        asset._asset_record["recordName"] = "linked-asset-record"
+        asset._asset_record["fields"]["isFavorite"] = {"value": 0}
+        with patch.object(helper, "CACHE", self.cache), \
+             patch.object(helper, "connect", return_value=self.api), \
+             patch.object(helper, "set_asset_flag", side_effect=helper.CloudMutationError("SERVICE_UNAVAILABLE")) as failed, \
+             patch.object(helper.time, "sleep"):
+            helper.cmd_favorite(SimpleNamespace(key=key, value=1), self.cfg)
+        self.assertEqual(failed.call_count, 3)
+        self.assertEqual(self.cat.get(key)["favorite"], 1)
+        self.assertEqual(self.cat.get(key)["favorite_sync"], "local-only")
+        restarted = catalog.Catalog(self.cache, self.cat.account)
+        self.addCleanup(restarted.db.close)
+        self.assertEqual(restarted.get(key)["favorite"], 1)
+
+        with patch.object(helper, "set_asset_flag", side_effect=helper.CloudMutationError("SERVICE_UNAVAILABLE")) as retry_failed:
+            catalog.sync(restarted, self.cfg, self.api, max_items=3)
+        self.assertEqual(retry_failed.call_count, 1)
+        self.assertEqual(restarted.get(key)["favorite"], 1)
+        self.assertEqual(restarted.get(key)["favorite_sync"], "local-only")
+
+        def accept_favorite(*args):
+            asset._asset_record["fields"]["isFavorite"] = {"value": 1}
+        with patch.object(helper, "set_asset_flag", side_effect=accept_favorite) as retried:
+            catalog.sync(restarted, self.cfg, self.api, max_items=3)
+        self.assertEqual(retried.call_count, 1)
+        self.assertEqual(restarted.get(key)["favorite"], 1)
+        self.assertEqual(restarted.get(key)["favorite_sync"], "synced")
+
+    def test_older_favorite_attempt_cannot_replace_newer_local_choice(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=1)
+        key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        self.cat.set_local_favorite(key, 1)
+        old_request = self.cat.get(key)
+        self.cat.set_local_favorite(key, 0)
+        with patch.object(helper, "set_asset_flag") as cloud_write:
+            self.assertFalse(helper.push_favorite(self.cat, old_request, self.api))
+        cloud_write.assert_not_called()
+        self.assertEqual(self.cat.get(key)["favorite"], 0)
+        self.assertEqual(self.cat.get(key)["favorite_sync"], "pending")
 
     def test_first_sync_publishes_cards_before_thumbnail_requests(self):
         exports = []
