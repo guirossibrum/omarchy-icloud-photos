@@ -184,7 +184,10 @@ def cmd_favorite(args, cfg):
         api = connect(cfg)
         library = dict(libraries(api))[row["zone"]]
         asset = matching_asset(library, row["record"])
-        set_asset_flag(library, row["record"], asset._asset_record["recordChangeTag"],
+        # Catalog IDs use the stable CPLMaster name; isFavorite belongs to
+        # its linked CPLAsset record, which has a different record name.
+        favorite_record = asset._asset_record
+        set_asset_flag(library, favorite_record["recordName"], favorite_record["recordChangeTag"],
                        "isFavorite", args.value == 1)
     with cat.db:
         cat.db.execute("UPDATE assets SET favorite=? WHERE id=? AND account=?",

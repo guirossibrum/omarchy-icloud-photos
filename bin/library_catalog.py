@@ -66,6 +66,7 @@ def metadata(asset, account, zone):
     capture = datetime.fromtimestamp(raw_date / 1000, timezone.utc) if raw_date is not None else None
     added = field(record, "addedDate")
     favorite = field(record, "isFavorite")
+    duration_ms = field(record, "duration")
     try:
         versions = asset.versions
     except (KeyError, ValueError, TypeError):
@@ -85,7 +86,8 @@ def metadata(asset, account, zone):
                 location=json.dumps(location) if location is not None else None,
                 camera=camera, size=field(master, "resOriginalRes") and field(master, "resOriginalRes").get("size"),
                 added_at=added / 1000 if isinstance(added, (int, float)) else None,
-                favorite=int(bool(favorite)) if favorite is not None else None)
+                favorite=int(bool(favorite)) if favorite is not None else None,
+                duration=duration_ms / 1000 if kind == "video" and isinstance(duration_ms, (int, float)) and duration_ms > 0 else None)
 
 
 class Catalog:
@@ -122,14 +124,15 @@ class Catalog:
     def upsert(self, data, seen):
         self.db.execute("""INSERT INTO assets
             (id, account, zone, record, name, kind, captured, ts, width, height,
-             timezone, location, camera, size, added_at, favorite, rank, seen)
+             timezone, location, camera, size, added_at, favorite, rank, duration, seen)
             VALUES (:id,:account,:zone,:record,:name,:kind,:captured,:ts,:width,:height,
-                    :timezone,:location,:camera,:size,:added_at,:favorite,:rank,:seen)
+                    :timezone,:location,:camera,:size,:added_at,:favorite,:rank,:duration,:seen)
             ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind,
             captured=excluded.captured, ts=excluded.ts, width=excluded.width,
             height=excluded.height, location=excluded.location, camera=excluded.camera,
             size=excluded.size, timezone=excluded.timezone, added_at=excluded.added_at,
-            favorite=excluded.favorite, rank=excluded.rank, seen=excluded.seen,
+            favorite=excluded.favorite, rank=excluded.rank,
+            duration=COALESCE(excluded.duration, assets.duration), seen=excluded.seen,
             state=CASE WHEN assets.state IN ('deleted','absent') THEN 'cloud-only' ELSE assets.state END""", {**data, "seen": seen})
 
     def get(self, key):

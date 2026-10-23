@@ -134,6 +134,7 @@ class CatalogTests(unittest.TestCase):
         self.api = API(self.personal, self.shared)
 
     def test_full_sync_pagination_thumbnail_only_and_shared_identity(self):
+        self.shared.assets[0]._asset_record["fields"]["duration"] = {"value": 33163}
         count = catalog.sync(self.cat, self.cfg, self.api)
         self.assertEqual(count, 652)
         self.assertEqual(self.personal.pages, 14)  # metadata, then fresh thumbnail URLs
@@ -142,6 +143,7 @@ class CatalogTests(unittest.TestCase):
         self.assertNotEqual(catalog.item_key(self.cat.account, "PrimarySync", "p0"),
                             catalog.item_key(self.cat.account, "SharedSync-fabricated", "p0"))
         video = self.cat.get(catalog.item_key(self.cat.account, "SharedSync-fabricated", "p0"))
+        self.assertAlmostEqual(video["duration"], 33.163)
         self.assertEqual(Path(video["thumb"]).read_bytes(), b"thumb")
         self.assertIsNone(video["original"])
         calls = self.personal.session.calls + self.shared.session.calls
@@ -226,6 +228,14 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(self.cat.get(key)["favorite"], 1)
             helper.cmd_favorite(SimpleNamespace(key=key, value=0), {**self.cfg, "DEMO": "1"})
             self.assertEqual(self.cat.get(key)["favorite"], 0)
+
+            master_key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+            self.personal.assets[0]._asset_record["recordName"] = "linked-asset-record"
+            with patch.object(helper, "connect", return_value=self.api), \
+                 patch.object(helper, "set_asset_flag") as update:
+                helper.cmd_favorite(SimpleNamespace(key=master_key, value=1), self.cfg)
+            self.assertEqual(update.call_args.args[1:],
+                             ("linked-asset-record", "tag", "isFavorite", True))
 
     def test_first_sync_publishes_cards_before_thumbnail_requests(self):
         exports = []
