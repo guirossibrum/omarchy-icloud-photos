@@ -32,10 +32,14 @@ ShellRoot {
   property var libraryItems: []
   property var days: []          // [{label, indices: [int]}]
   property string activeSection: "library"
+  property var albumRows: []
+  property var albumKeys: ({})
+  property bool albumLoading: false
   property string searchText: ""
   property bool sidebarOpen: true
   property int calendarYear: new Date().getFullYear()
   property bool slideshowRunning: false
+  property var slideshowIds: []
   property string prioritySignature: ""
   property int selected: -1
   onSelectedChanged: if (grid && !suppressReveal) grid.revealIndex(selected)
@@ -49,6 +53,7 @@ ShellRoot {
   property int checkedCount: 0
   property int anchor: -1
   property bool viewerOpen: false
+  property string previewForId: ""
   property bool helpOpen: false
   // Details panel in the viewer (`i`): rows for the item it was fetched for.
   property bool infoOpen: false
@@ -208,12 +213,97 @@ ShellRoot {
     }
     onFileChanged: reload()
   }
+  FileView {
+    id: albumIndexFile
+    path: root.cacheDir + "/album-index.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try { var rows = JSON.parse(text()); if (Array.isArray(rows)) root.albumRows = rows; } catch (e) {}
+    }
+    onFileChanged: reload()
+  }
+  FileView {
+    id: albumMembersFile
+    path: root.activeSection.indexOf("album:") === 0 ?
+          root.cacheDir + "/albums/" + root.activeSection.slice(6) + ".json" : ""
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var data = JSON.parse(text());
+        if (root.activeSection !== "album:" + data.albumId) return;
+        var map = {};
+        for (var i = 0; i < data.ids.length; i++) map[data.ids[i]] = true;
+        root.albumKeys = map;
+        root.albumLoading = !data.complete;
+        root.applyIndex(JSON.stringify(root.libraryItems));
+      } catch (e) {}
+    }
+    onFileChanged: reload()
+  }
+  Process {
+    id: albumProc
+    onExited: (code, status) => {
+      albumMembersFile.reload();
+      if (code !== 0) root.albumLoading = false;
+      if (root.activeSection.indexOf("album:") === 0 && root.activeSection.slice(6) !== albumProc.itemId)
+        albumLoadTimer.restart();
+    }
+    property string itemId: ""
+  }
+  Timer {
+    id: albumLoadTimer
+    interval: 150
+    onTriggered: {
+      if (root.activeSection.indexOf("album:") !== 0) return;
+      if (albumProc.running) { albumLoadTimer.restart(); return; }
+      albumProc.itemId = root.activeSection.slice(6);
+      albumProc.command = [catalogScript, "album-members", albumProc.itemId];
+      albumProc.running = true;
+    }
+  }
 
   Process {
     id: sync
     command: [root.syncScript]
     running: false
-    onExited: { indexFile.reload(); statusFile.reload(); }
+    onExited: { indexFile.reload(); albumIndexFile.reload(); statusFile.reload(); root.startPolicy(); }
+  }
+
+  Process {
+    id: policyProc
+    running: false
+    onExited: indexFile.reload()
+  }
+  Timer {
+    interval: 30000
+    repeat: true
+    running: true
+    triggeredOnStart: true
+    onTriggered: root.startPolicy()
+  }
+  function startPolicy() {
+    if (sync.running || policyProc.running || needLogin || indexMissing) return;
+    policyProc.command = [catalogScript, "policy", "--limit", "12"];
+    policyProc.running = true;
+  }
+
+  Process {
+    id: previewProc
+    property string itemId: ""
+    onExited: {
+      indexFile.reload();
+      if (root.viewerOpen && root.current && root.current.id !== itemId) previewTimer.restart();
+    }
+  }
+  Timer { id: previewTimer; interval: 150; onTriggered: root.loadViewerPreview() }
+  function loadViewerPreview() {
+    if (!viewerOpen || !current || current.kind === "video" || current.downloaded ||
+        (current.preview && current.preview !== current.thumb) || previewProc.running || needLogin) return;
+    previewProc.itemId = current.id;
+    previewProc.command = [catalogScript, "preview", current.id];
+    previewProc.running = true;
   }
 
   Process {
@@ -259,6 +349,17 @@ ShellRoot {
       indexFile.reload();
       toast.show(code === 0 ? "Local download removed; copy kept in iCloud" : "Could not remove local download", 3500);
     }
+  }
+  Process {
+    id: keepOfflineProc
+    onExited: indexFile.reload()
+  }
+  function keepOffline(items) {
+    var list = Array.isArray(items) ? items : [items];
+    var ids = list.filter(function (it) { return it && it.downloaded && !it.keptOffline; }).map(function (it) { return it.id; });
+    if (!ids.length || keepOfflineProc.running) return;
+    keepOfflineProc.command = [catalogScript, "keep-offline"].concat(ids);
+    keepOfflineProc.running = true;
   }
   Process {
     id: priorityProc
@@ -500,8 +601,20 @@ ShellRoot {
     JsonAdapter {
       id: settings
       property int cell: 176
+      property string downloadMode: "manual"
+      property int recentDays: 30
+      property int previewDays: 7
     }
   }
+
+  function updateDownloadMode(mode) {
+    if (mode !== "manual" && mode !== "recent" && mode !== "all") return;
+    if (policyProc.running) policyProc.running = false;
+    settings.downloadMode = mode;
+    settingsFile.writeAdapter();
+    policyStartTimer.restart();
+  }
+  Timer { id: policyStartTimer; interval: 500; onTriggered: root.startPolicy() }
 
   function applyIndex(raw) {
     var list;
@@ -531,6 +644,11 @@ ShellRoot {
     var names = { library: "Library", favorites: "Favorites", recents: "Recents",
                   downloaded: "Downloaded", videos: "Videos", live: "Live Photos",
                   shared: "Shared Library" };
+    if (activeSection.indexOf("album:") === 0) {
+      var id = activeSection.slice(6);
+      var row = albumRows.find(function (a) { return a.id === id; });
+      return row ? row.title : "Album";
+    }
     return names[activeSection] || "Library";
   }
 
@@ -542,6 +660,7 @@ ShellRoot {
     if (activeSection === "videos") return it.kind === "video";
     if (activeSection === "live") return it.kind === "live";
     if (activeSection === "shared") return it.shared === true;
+    if (activeSection.indexOf("album:") === 0) return albumKeys[it.id] === true;
     return true;
   }
 
@@ -550,6 +669,12 @@ ShellRoot {
   function selectSection(section) {
     if (activeSection === section) return;
     activeSection = section;
+    if (section.indexOf("album:") === 0) {
+      albumKeys = ({});
+      albumLoading = true;
+      albumMembersFile.reload();
+      albumLoadTimer.restart();
+    }
     viewerOpen = false;
     clearChecked();
     pinBottom = true;
@@ -921,9 +1046,11 @@ ShellRoot {
   onCurrentChanged: {
     if (infoOpen && viewerOpen) fetchInfo();
     if (current && current.id !== failedDownloadId && !originalDownload.running) downloadError = "";
+    if (viewerOpen) previewTimer.restart();
   }
   onViewerOpenChanged: {
-    if (!viewerOpen) { infoOpen = false; slideTimer.stop(); slideshowRunning = false; }
+    if (!viewerOpen) { infoOpen = false; slideTimer.stop(); slideshowRunning = false; slideshowIds = []; }
+    else previewTimer.restart();
   }
 
   function copyPath() {
@@ -960,8 +1087,15 @@ ShellRoot {
     if (list && list.length > 0) pendingDelete = latestItems(list);
   }
 
-  function startSlideshow() {
-    if (!current) return;
+  function startSlideshow(selectedItems) {
+    var list = selectedItems && selectedItems.length ? selectedItems : targets();
+    if (!list.length) return;
+    slideshowIds = list.length > 1 ? list.map(function (it) { return it.id; }) : [];
+    if (slideshowIds.length > 1) {
+      var first = items.findIndex(function (it) { return it.id === slideshowIds[0]; });
+      if (first < 0) return;
+      selected = first;
+    }
     viewerOpen = true;
     slideshowRunning = true;
     slideTimer.start();
@@ -973,7 +1107,15 @@ ShellRoot {
     repeat: true
     onTriggered: {
       if (!root.viewerOpen || root.items.length < 2) { stop(); root.slideshowRunning = false; return; }
-      root.jumpTo((root.selected + 1) % root.items.length, false);
+      if (root.slideshowIds.length > 1) {
+        var present = root.slideshowIds.filter(function (id) {
+          return root.items.some(function (it) { return it.id === id; });
+        });
+        if (present.length < 2) { stop(); root.slideshowRunning = false; return; }
+        var at = present.indexOf(root.current ? root.current.id : "");
+        var nextId = present[(at + 1) % present.length];
+        root.selected = root.items.findIndex(function (it) { return it.id === nextId; });
+      } else root.jumpTo((root.selected + 1) % root.items.length, false);
     }
   }
 
@@ -1218,12 +1360,83 @@ ShellRoot {
         theme: appTheme
         onRequestCopy: items => root.copyCurrent(items)
         onRequestEvict: items => root.evictLocal(items)
+        onRequestKeepOffline: items => root.keepOffline(items)
         onRequestDownload: items => root.ensureMany(items.filter(function (it) { return !it.downloaded; }), function () { toast.show("Originals downloaded", 2500); })
         onRequestSave: items => root.saveToDownloads(items)
         onRequestOpen: root.openCurrent()
-        onRequestSlideshow: root.startSlideshow()
+        onRequestSlideshow: items => root.startSlideshow(items)
         onRequestDelete: root.askDeleteItems(items)
         onClosed: keys.forceActiveFocus()
+      }
+
+      Popup {
+        id: downloadSettings
+        x: Math.max(sidebar.width + 8, parent.width - width - 12)
+        y: 49
+        width: 350
+        height: settingsColumn.implicitHeight + 28
+        padding: 14
+        modal: false
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle { color: appTheme.darkBackground; radius: 10; border.color: appTheme.lighterBackground }
+        Column {
+          id: settingsColumn
+          width: parent.width
+          spacing: 10
+          Text { text: "Storage settings"; color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 17; font.bold: true }
+          Text { width: parent.width; wrapMode: Text.Wrap; text: "Photos open from a thumbnail, then load a sharper preview. Originals are kept according to your choice below."; color: appTheme.darkForeground; font.family: appTheme.fontFamily; font.pixelSize: 12 }
+          Repeater {
+            model: [
+              { value: "manual", label: "Manual only", detail: "Keep only originals I explicitly chose to save." },
+              { value: "recent", label: "Recent originals", detail: "Keep recent originals; older automatic downloads expire." },
+              { value: "all", label: "All originals", detail: "Gradually download the full catalog in the background." }
+            ]
+            delegate: Rectangle {
+              required property var modelData
+              width: settingsColumn.width; height: 47; radius: 6
+              color: settings.downloadMode === modelData.value ? appTheme.lighterBackground : appTheme.background
+              Row {
+                anchors.fill: parent; anchors.leftMargin: 10; spacing: 9
+                Text { anchors.verticalCenter: parent.verticalCenter; text: settings.downloadMode === modelData.value ? "◉" : "○"; color: appTheme.accent; font.pixelSize: 18 }
+                Column {
+                  anchors.verticalCenter: parent.verticalCenter
+                  Text { text: modelData.label; color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 13 }
+                  Text { text: modelData.detail; color: appTheme.darkForeground; font.family: appTheme.fontFamily; font.pixelSize: 10 }
+                }
+              }
+              MouseArea { anchors.fill: parent; onClicked: root.updateDownloadMode(modelData.value) }
+            }
+          }
+          Row {
+            spacing: 8
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "Recent window (days)"; color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 12 }
+            TextField {
+              width: 66; height: 30; enabled: settings.downloadMode === "recent"
+              text: String(settings.recentDays); validator: IntValidator { bottom: 1; top: 3650 }
+              color: appTheme.brightForeground
+              onEditingFinished: {
+                var n = parseInt(text);
+                if (n >= 1 && n <= 3650) { settings.recentDays = n; settingsFile.writeAdapter(); policyStartTimer.restart(); }
+                else text = String(settings.recentDays);
+              }
+            }
+          }
+          Row {
+            spacing: 8
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "Clear unused previews after (days)"; color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 12 }
+            TextField {
+              width: 58; height: 30
+              text: String(settings.previewDays); validator: IntValidator { bottom: 1; top: 3650 }
+              color: appTheme.brightForeground
+              onEditingFinished: {
+                var n = parseInt(text);
+                if (n >= 1 && n <= 3650) { settings.previewDays = n; settingsFile.writeAdapter(); }
+                else text = String(settings.previewDays);
+              }
+            }
+          }
+          Text { width: parent.width; wrapMode: Text.Wrap; text: "A local removal stays removed until you download it again. Manually kept originals are never cleared by the recent window."; color: appTheme.darkForeground; font.family: appTheme.fontFamily; font.pixelSize: 11 }
+        }
       }
 
       Popup {
@@ -1406,6 +1619,7 @@ ShellRoot {
         expanded: root.sidebarOpen
         theme: appTheme
         section: root.activeSection
+        albumRows: root.albumRows
         onSectionSelected: section => root.selectSection(section)
         onToggleRequested: root.sidebarOpen = false
       }
@@ -1444,6 +1658,10 @@ ShellRoot {
             onActivated: root.startSync()
           }
           ActionIcon {
+            theme: appTheme; icon: "\uf013"; hint: "Storage settings"
+            onActivated: downloadSettings.open()
+          }
+          ActionIcon {
             theme: appTheme; icon: "\uf14d"; hint: "Save copy to Downloads"
             available: root.current !== null
             onActivated: root.saveToDownloads()
@@ -1456,8 +1674,8 @@ ShellRoot {
           }
           ActionIcon {
             theme: appTheme; icon: "\uf019"; hint: "Download original"
-            available: root.current !== null && !root.current.downloaded
-            onActivated: root.ensureOriginal(root.current)
+            available: root.current !== null && (!root.current.downloaded || !root.current.keptOffline)
+            onActivated: root.current && root.current.downloaded ? root.keepOffline(root.current) : root.ensureOriginal(root.current)
           }
           ActionIcon {
             theme: appTheme; icon: "\uf1f8"; hint: "Delete from iCloud…"
@@ -1890,7 +2108,7 @@ ShellRoot {
         visible: root.items.length === 0 && !root.needLogin
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
-          text: root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No items in " + root.sectionTitle())
+          text: root.albumLoading && root.activeSection.indexOf("album:") === 0 ? "Loading album…" : root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No items in " + root.sectionTitle())
           color: appTheme.foreground
           font.family: appTheme.fontFamily
           font.pixelSize: 16
@@ -2039,7 +2257,7 @@ ShellRoot {
         onRequestPrev: root.move(-1)
         onRequestCopyPath: root.copyPath()
         onRequestSave: root.saveToDownloads()
-        onRequestDownload: if (root.current) root.ensureOriginal(root.current)
+        onRequestDownload: if (root.current) root.current.downloaded ? root.keepOffline(root.current) : root.ensureOriginal(root.current)
         onRequestRetry: if (root.current) {
           if (root.current.kind === "video") root.playVideo(root.current);
           else root.ensureOriginal(root.current, null, root.downloadingComponent === "motion" ? "motion" : "original");

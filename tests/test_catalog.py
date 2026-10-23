@@ -1,5 +1,6 @@
 """Synthetic cloud contract tests. These never authenticate or touch a live account."""
 import importlib.util
+import base64
 import json
 import sqlite3
 from pathlib import Path
@@ -55,7 +56,7 @@ class Asset:
 
     def download(self, session, url):
         session.calls.append(url)
-        return Response(b"thumb" if url.startswith("thumb:") else b"original" if url.startswith("original:") else b"motion")
+        return Response(b"thumb" if url.startswith("thumb:") else b"original" if url.startswith(("original:", "medium:")) else b"motion")
 
     @property
     def item_type(self):
@@ -188,6 +189,12 @@ class CatalogTests(unittest.TestCase):
         """)
         db.execute("INSERT INTO assets(id,account,zone,record,name,kind) VALUES(?,?,?,?,?,?)",
                    ("fabricated-key", self.cat.account, "PrimarySync", "fabricated-record", "fabricated.jpg", "photo"))
+        old_original = old_cache / "originals" / "old-owned" / "saved.jpg"
+        old_original.parent.mkdir(parents=True)
+        old_original.write_bytes(b"fabricated")
+        db.execute("""INSERT INTO assets(id,account,zone,record,name,kind,original,owned,state)
+            VALUES(?,?,?,?,?,?,?,?,?)""", ("old-owned", self.cat.account, "PrimarySync",
+            "old-record", "saved.jpg", "photo", str(old_original), 1, "downloaded"))
         db.commit()
         db.close()
         migrated = catalog.Catalog(old_cache, self.cat.account)
@@ -198,6 +205,9 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(migrated.get("fabricated-key")["rank"])
         self.assertIsNone(migrated.get("fabricated-key")["duration"])
         self.assertEqual(migrated.get("fabricated-key")["favorite_sync"], "synced")
+        self.assertTrue(migrated.get("old-owned")["keep_offline"])
+        self.assertEqual(catalog.apply_download_policy(migrated, self.cfg), 0)
+        self.assertTrue(old_original.exists())
 
     def test_video_length_from_existing_original_and_favorite_request(self):
         catalog.sync(self.cat, self.cfg, self.api, max_items=3)
@@ -512,6 +522,122 @@ class CatalogTests(unittest.TestCase):
             self.cat.db.execute("UPDATE assets SET original=?, owned=1 WHERE id=?", (str(outside), key))
         catalog.evict(self.cat, [key])
         self.assertEqual(outside.read_bytes(), b"leave me")
+
+    def test_open_photo_uses_medium_preview_without_original_fallback(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=1)
+        key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        asset = self.personal.assets[0]
+        before = list(self.personal.session.calls)
+        self.assertIsNone(catalog.preview(self.cat, self.cfg, key, self.api))
+        self.assertEqual(before, self.personal.session.calls)
+        asset.versions[AssetVersionSize.MEDIUM] = AssetVersion(8, "medium:PrimarySync:p0", "image/jpeg", "")
+        with patch.object(asset, "download", return_value=Response(b"original")) as fetch:
+            path = catalog.preview(self.cat, self.cfg, key, self.api)
+        self.assertTrue(Path(path).is_file())
+        self.assertEqual(fetch.call_args.args[1], "medium:PrimarySync:p0")
+        self.assertIsNone(self.cat.get(key)["original"])
+        exported = json.loads((self.cache / "index.json").read_text())[0]
+        self.assertEqual(exported["preview"], path)
+        self.assertFalse(exported["downloaded"])
+        self.assertEqual(catalog.preview(self.cat, self.cfg, key, self.api), path)
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_download_modes_recent_retention_pin_and_explicit_eviction(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=3)
+        now = self.cat.get(catalog.item_key(self.cat.account, "PrimarySync", "p0"))["ts"] + 86400
+        first = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        second = catalog.item_key(self.cat.account, "PrimarySync", "p1")
+        self.assertEqual(catalog.apply_download_policy(self.cat, self.cfg, self.api, now=now), 0)
+        (self.cache / "settings.json").write_text(json.dumps({"downloadMode": "recent", "recentDays": 2}))
+        with patch.object(catalog.time, "sleep"):
+            self.assertEqual(catalog.apply_download_policy(self.cat, self.cfg, self.api, limit=3, now=now), 2)
+        self.assertTrue(self.cat.get(first)["original"])
+        self.assertFalse(self.cat.get(first)["keep_offline"])
+        # A user choice pins an automatically fetched original.
+        catalog.download(self.cat, self.cfg, first, api=self.api)
+        self.assertTrue(self.cat.get(first)["keep_offline"])
+        before = list(self.personal.session.calls)
+        catalog.evict(self.cat, [second])
+        self.assertEqual(before, self.personal.session.calls)
+        self.assertTrue(self.cat.get(second)["auto_excluded"])
+        restarted = catalog.Catalog(self.cache, self.cat.account)
+        self.addCleanup(restarted.db.close)
+        with patch.object(catalog.time, "sleep"):
+            self.assertEqual(catalog.apply_download_policy(restarted, self.cfg, self.api, now=now), 0)
+            self.assertEqual(catalog.apply_download_policy(restarted, self.cfg, self.api, now=now + 10 * 86400), 0)
+        self.assertTrue(restarted.get(first)["original"])
+        self.assertIsNone(restarted.get(second)["original"])
+        catalog.download(restarted, self.cfg, second, api=self.api)
+        self.assertFalse(restarted.get(second)["auto_excluded"])
+        self.assertTrue(restarted.get(second)["keep_offline"])
+
+    def test_all_mode_includes_old_assets_and_live_motion(self):
+        catalog.sync(self.cat, self.cfg, self.api)
+        (self.cache / "settings.json").write_text(json.dumps({"downloadMode": "all"}))
+        old = catalog.item_key(self.cat.account, "PrimarySync", "p649")
+        live = catalog.item_key(self.cat.account, "SharedSync-fabricated", "live")
+        # Keep the batch small and force the requested records to the front.
+        with self.cat.db:
+            self.cat.db.execute("UPDATE assets SET auto_excluded=1 WHERE id NOT IN (?,?)", (old, live))
+        with patch.object(catalog.time, "sleep"):
+            self.assertEqual(catalog.apply_download_policy(self.cat, self.cfg, self.api, limit=2), 2)
+            self.assertEqual(catalog.apply_download_policy(self.cat, self.cfg, self.api, limit=2), 1)
+        self.assertTrue(self.cat.get(old)["original"])
+        self.assertTrue(self.cat.get(live)["original"])
+        self.assertTrue(self.cat.get(live)["motion"])
+        self.assertFalse(self.cat.get(live)["keep_offline"])
+
+    def test_preview_expiry_keeps_thumbnail_and_catalog(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=1)
+        key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        asset = self.personal.assets[0]
+        asset.versions[AssetVersionSize.MEDIUM] = AssetVersion(8, "medium:PrimarySync:p0", "image/jpeg", "")
+        path = Path(catalog.preview(self.cat, self.cfg, key, self.api))
+        import os
+        os.utime(path, (1, 1))
+        catalog.expire_previews(self.cat)
+        self.assertFalse(path.exists())
+        self.assertTrue(Path(self.cat.get(key)["thumb"]).exists())
+        self.assertEqual(len(json.loads((self.cache / "index.json").read_text())), 1)
+
+    def test_switching_to_manual_removes_only_unpinned_app_originals(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=2)
+        first = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        second = catalog.item_key(self.cat.account, "PrimarySync", "p1")
+        (self.cache / "settings.json").write_text(json.dumps({"downloadMode": "all"}))
+        with patch.object(catalog.time, "sleep"):
+            catalog.apply_download_policy(self.cat, self.cfg, self.api, limit=2)
+        catalog.download(self.cat, self.cfg, first, api=self.api)  # explicit keep
+        thumbnail = Path(self.cat.get(second)["thumb"])
+        (self.cache / "settings.json").write_text(json.dumps({"downloadMode": "manual"}))
+        catalog.apply_download_policy(self.cat, self.cfg, self.api)
+        self.assertTrue(Path(self.cat.get(first)["original"]).exists())
+        self.assertIsNone(self.cat.get(second)["original"])
+        self.assertTrue(thumbnail.exists())
+        self.assertFalse(self.cat.get(second)["auto_excluded"])
+
+    def test_album_list_and_members_use_stable_ids_without_originals(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=230)
+        self.personal.library_type = "private"
+        self.personal.params = {}
+        self.personal.service_endpoint = "https://fabricated.invalid"
+        self.personal.zone_id = {"zoneName": "PrimarySync"}
+        title = base64.b64encode(b"Fabricated Album").decode()
+        self.personal._fetch_folders = lambda: [
+            {"recordName": folder, "fields": {"albumNameEnc": {"value": title}}}
+            for folder in ("folder-one", "folder-two")]
+        catalog.refresh_albums(self.cat, self.cfg, self.api, force=True)
+        rows = json.loads((self.cache / "album-index.json").read_text())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["title"], rows[1]["title"])
+        self.assertNotEqual(rows[0]["id"], rows[1]["id"])
+        with patch.object(catalog, "PhotoAlbum", side_effect=lambda *a, **k: self.personal.assets[:230]):
+            catalog.load_album_members(self.cat, self.cfg, rows[0]["id"], self.api)
+        members = json.loads((self.cache / "albums" / (rows[0]["id"] + ".json")).read_text())
+        self.assertTrue(members["complete"])
+        self.assertEqual(len(members["ids"]), 230)
+        self.assertEqual(members["ids"][0], catalog.item_key(self.cat.account, "PrimarySync", "p0"))
+        self.assertTrue(all(not x["downloaded"] for x in json.loads((self.cache / "index.json").read_text())))
 
 
 if __name__ == "__main__":

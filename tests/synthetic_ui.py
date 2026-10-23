@@ -33,6 +33,11 @@ for i in range(750):
                       favorite=i % 11 == 0, addedAt=(datetime.now(timezone.utc) - timedelta(days=i % 45)).timestamp(),
                       evictable=False))
 (cache / "index.json").write_text(json.dumps(items))
+(cache / "album-index.json").write_text(json.dumps([
+    {"id": "fabricated-album", "title": "Fabricated Album", "zone": "PrimarySync"}]))
+(cache / "albums").mkdir(exist_ok=True)
+(cache / "albums" / "fabricated-album.json").write_text(json.dumps({
+    "albumId": "fabricated-album", "ids": [item["id"] for item in items[::13]], "complete": True}))
 (cache / "status.json").write_text(json.dumps(dict(state="ok", message="", count=len(items),
                                                    at=datetime.now(timezone.utc).isoformat())))
 print(f"{len(items)} fabricated items across 75 days in {root}")

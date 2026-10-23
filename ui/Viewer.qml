@@ -570,23 +570,23 @@ Rectangle {
         width: localLabel.implicitWidth + 24
         height: 28
         radius: 6
-        color: localArea.containsMouse && !item.downloaded ? theme.lighterBackground : "transparent"
+        color: localArea.containsMouse && (!item.downloaded || !item.keptOffline) ? theme.lighterBackground : "transparent"
         border.color: theme.lighterBackground
         border.width: 1
         Text {
           id: localLabel
           anchors.centerIn: parent
           text: downloadState === "downloading" ? "Cancel" :
-                item && item.downloaded ? "Downloaded" :
+                item && item.downloaded ? (item.keptOffline ? "Kept offline" : "Keep original offline") :
                 downloadState === "failed" ? "Retry download" : "Download original"
-          color: item && item.downloaded ? theme.darkForeground : theme.foreground
+          color: item && item.keptOffline ? theme.darkForeground : theme.foreground
           font.family: theme.fontFamily
           font.pixelSize: theme.fontSize - 1
         }
         MouseArea {
           id: localArea
           anchors.fill: parent
-          enabled: item && (!item.downloaded || downloadState === "downloading")
+          enabled: item && (!item.keptOffline || downloadState === "downloading")
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onClicked: downloadState === "downloading" ? root.requestCancel() : root.requestDownload()

@@ -6,6 +6,8 @@ Rectangle {
   property string section: "library"
   property bool expanded: true
   property bool mediaExpanded: true
+  property bool albumsExpanded: true
+  property var albumRows: []
   signal sectionSelected(string section)
   signal toggleRequested()
 
@@ -93,6 +95,26 @@ Rectangle {
         color: theme.foreground
         font.family: theme.fontFamily
         font.pixelSize: theme.fontSize - 1
+      }
+      Rectangle {
+        x: 8; width: parent.width - 16; height: 33; radius: 7
+        color: albumsArea.containsMouse ? Qt.lighter(theme.darkBackground, 1.25) : "transparent"
+        Text { x: 8; anchors.verticalCenter: parent.verticalCenter; text: root.albumsExpanded ? "⌄" : "›"; color: theme.darkForeground; font.pixelSize: 16 }
+        Text { x: 39; anchors.verticalCenter: parent.verticalCenter; text: "\uf07b"; color: theme.accent; font.family: theme.fontFamily; font.pixelSize: 16 }
+        Text { x: 70; anchors.verticalCenter: parent.verticalCenter; text: "Albums"; color: theme.brightForeground; font.family: theme.fontFamily; font.pixelSize: theme.fontSize }
+        MouseArea { id: albumsArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.albumsExpanded = !root.albumsExpanded }
+      }
+      Repeater {
+        model: root.albumsExpanded ? root.albumRows : []
+        delegate: SidebarEntry {
+          required property var modelData
+          theme: root.theme
+          label: modelData.title
+          icon: "\uf07c"
+          indent: 16
+          selected: root.section === "album:" + modelData.id
+          onActivated: root.sectionSelected("album:" + modelData.id)
+        }
       }
       Rectangle {
         x: 8; width: parent.width - 16; height: 33; radius: 7

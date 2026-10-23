@@ -8,9 +8,10 @@ Menu {
   signal requestCopy(var items)
   signal requestEvict(var items)
   signal requestDownload(var items)
+  signal requestKeepOffline(var items)
   signal requestSave(var items)
   signal requestOpen()
-  signal requestSlideshow()
+  signal requestSlideshow(var items)
   signal requestDelete()
 
   width: 300
@@ -31,6 +32,12 @@ Menu {
     text: root.items.length > 1 ? "Download " + root.items.length + " originals" : "Download Original"
     enabled: root.items.some(function (it) { return !it.downloaded; })
     onTriggered: root.requestDownload(root.items)
+  }
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf0c7"
+    text: root.items.length > 1 ? "Keep selected originals offline" : "Keep Original Offline"
+    enabled: root.items.some(function (it) { return it.downloaded && !it.keptOffline; })
+    onTriggered: root.requestKeepOffline(root.items)
   }
   ActionMenuItem {
     theme: root.theme; glyph: "\uf14d"
@@ -58,8 +65,8 @@ Menu {
   }
   ActionMenuItem {
     theme: root.theme; glyph: "\uf144"; text: "Start Slideshow"
-    enabled: root.items.length === 1
-    onTriggered: root.requestSlideshow()
+    enabled: root.items.length > 0
+    onTriggered: root.requestSlideshow(root.items)
   }
   MenuSeparator {}
   ActionMenuItem {

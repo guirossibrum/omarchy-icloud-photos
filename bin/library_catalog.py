@@ -5,6 +5,7 @@ The only files eligible for eviction live under cache/originals and are recorded
 as owned. Legacy icloudpd downloads are indexed in place but never removed.
 """
 import argparse
+import base64
 import contextlib
 from datetime import datetime, timezone
 import fcntl
@@ -24,6 +25,7 @@ from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
 from pyicloud_ipd.asset_version import AssetVersion
 from pyicloud_ipd.exceptions import PyiCloudFailedLoginException
 from pyicloud_ipd.item_type import AssetItemType
+from pyicloud_ipd.services.photos import PhotoAlbum
 
 from icloud_helper import read_config
 
@@ -108,6 +110,8 @@ class Catalog:
               favorite_attempts INTEGER NOT NULL DEFAULT 0, favorite_error TEXT,
               rank INTEGER, duration REAL,
               original TEXT, motion TEXT, owned INTEGER NOT NULL DEFAULT 0,
+              keep_offline INTEGER NOT NULL DEFAULT 0,
+              auto_excluded INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL DEFAULT 'cloud-only', error TEXT,
               seen INTEGER NOT NULL DEFAULT 0,
               UNIQUE(account, zone, record));
@@ -115,15 +119,25 @@ class Catalog:
             CREATE TABLE IF NOT EXISTS scans (
               account TEXT NOT NULL, zone TEXT NOT NULL, full_at INTEGER NOT NULL,
               PRIMARY KEY(account, zone));
+            CREATE TABLE IF NOT EXISTS albums (
+              id TEXT PRIMARY KEY, account TEXT NOT NULL, zone TEXT NOT NULL,
+              record TEXT NOT NULL, title TEXT NOT NULL, seen INTEGER NOT NULL,
+              UNIQUE(account, zone, record));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(assets)")}
         for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER"),
                            ("favorite_sync", "TEXT NOT NULL DEFAULT 'synced'"),
                            ("favorite_attempts", "INTEGER NOT NULL DEFAULT 0"),
                            ("favorite_error", "TEXT"), ("rank", "INTEGER"),
-                           ("duration", "REAL")):
+                           ("duration", "REAL"),
+                           ("keep_offline", "INTEGER NOT NULL DEFAULT 0"),
+                           ("auto_excluded", "INTEGER NOT NULL DEFAULT 0")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE assets ADD COLUMN {name} {kind}")
+        if "keep_offline" not in columns:
+            # Every pre-policy app-owned original came from an explicit
+            # download. Preserve it when the new policy is first enabled.
+            self.db.execute("UPDATE assets SET keep_offline=1 WHERE owned=1")
         self.db.commit()
 
     def upsert(self, data, seen):
@@ -176,6 +190,7 @@ class Catalog:
             motion = r["motion"] if r["motion"] and Path(r["motion"]).is_file() else ""
             thumb = r["thumb"] if r["thumb"] and Path(r["thumb"]).is_file() else ""
             derived = self.cache / "previews" / (r["id"] + ".jpg")
+            quick = self.cache / "view-previews" / (r["id"] + ".jpg")
             sdr = self.cache / "videos" / (r["id"] + ".mp4")
             ts = r["ts"] or 0
             local = datetime.fromtimestamp(ts).astimezone() if r["ts"] is not None else None
@@ -184,11 +199,11 @@ class Catalog:
                 timezone=r["timezone"],
                 date=local.strftime("%Y-%m-%d") if local else "Unknown",
                 time=local.strftime("%H:%M") if local else "",
-                thumb=thumb, preview=str(derived) if original and derived.is_file() else (original or thumb), path=original,
+                thumb=thumb, preview=str(derived) if original and derived.is_file() else (original or (str(quick) if quick.is_file() else thumb)), path=original,
                 video=(str(sdr) if sdr.is_file() else original) if r["kind"] == "video" else motion,
                 shared=r["zone"] != "PrimarySync", duration=r["duration"] or 0,
                 width=r["width"], height=r["height"], location=json.loads(r["location"]) if r["location"] else None,
-                camera=r["camera"], size=r["size"], downloaded=bool(original),
+                camera=r["camera"], size=r["size"], downloaded=bool(original), keptOffline=bool(r["keep_offline"]),
                 addedAt=r["added_at"], favorite=bool(r["favorite"]) if r["favorite"] is not None else None,
                 favoriteSync=r["favorite_sync"],
                 evictable=bool(original and r["owned"]),
@@ -214,6 +229,98 @@ def atomic_json(path, value):
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False))
     os.replace(tmp, path)
+
+
+def preferences(cache):
+    """A malformed or old settings file must never enable bulk downloads."""
+    try:
+        raw = json.loads((Path(cache) / "settings.json").read_text())
+    except (OSError, ValueError, TypeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = raw.get("downloadMode", "manual")
+    if mode not in ("manual", "recent", "all"):
+        mode = "manual"
+    def days(name, default):
+        value = raw.get(name, default)
+        return value if type(value) is int and 1 <= value <= 3650 else default
+    return dict(mode=mode, recent_days=days("recentDays", 30), preview_days=days("previewDays", 7))
+
+
+def expire_previews(cat):
+    cutoff = time.time() - preferences(cat.cache)["preview_days"] * 86400
+    root = cat.cache / "view-previews"
+    if not root.is_dir():
+        return
+    for path in root.glob("*.jpg"):
+        if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+            path.unlink()
+    cat.export()
+
+
+def refresh_albums(cat, cfg, api, force=False):
+    """List real user albums by stable folder ID; this costs one query per zone."""
+    index = cat.cache / "album-index.json"
+    if not force and index.is_file() and time.time() - index.stat().st_mtime < 6 * 3600:
+        return
+    seen = time.time_ns()
+    try:
+        for zone, library in libraries(api, cfg.get("SHARED_LIBRARY", "auto")):
+            if getattr(library, "library_type", "shared") != "private":
+                continue  # Installed pyicloud exposes no folders for shared DB zones.
+            for folder in library._fetch_folders():
+                raw = folder["recordName"]
+                if raw in ("----Root-Folder----", "----Project-Root-Folder----"):
+                    continue
+                if field(folder, "isDeleted"):
+                    continue
+                encoded = field(folder, "albumNameEnc")
+                if not encoded:
+                    continue
+                title = base64.b64decode(encoded).decode("utf-8")
+                key = item_key(cat.account, zone, "album:" + raw)
+                cat.db.execute("""INSERT INTO albums(id,account,zone,record,title,seen)
+                    VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,seen=excluded.seen""",
+                    (key, cat.account, zone, raw, title, seen))
+        cat.db.execute("DELETE FROM albums WHERE account=? AND seen!=?", (cat.account, seen))
+        cat.db.commit()
+    except Exception:
+        cat.db.rollback()
+        return  # Album availability must not fail the main library sync.
+    atomic_json(index, [dict(id=row["id"], title=row["title"], zone=row["zone"])
+                        for row in cat.db.execute("SELECT * FROM albums WHERE account=? ORDER BY title,id", (cat.account,))])
+
+
+def load_album_members(cat, cfg, key, api=None, max_items=None):
+    row = cat.db.execute("SELECT * FROM albums WHERE account=? AND id=?", (cat.account, key)).fetchone()
+    if row is None:
+        raise ValueError("album is absent from this account's catalog")
+    path = cat.cache / "albums" / (key + ".json")
+    if path.is_file() and time.time() - path.stat().st_mtime < 1800:
+        try:
+            cached = json.loads(path.read_text())
+            if cached.get("complete") and (not cached.get("limited") or cached.get("limit") == max_items):
+                return
+        except (OSError, ValueError):
+            pass
+    api = api or cloud(cfg)
+    library = dict(libraries(api, cfg.get("SHARED_LIBRARY", "auto")))[row["zone"]]
+    folder_id = row["record"]
+    album = PhotoAlbum(library.params, library.session, library.service_endpoint,
+        row["title"], "CPLContainerRelationLiveByAssetDate",
+        f"CPLContainerRelationNotDeletedByAssetDate:{folder_id}",
+        [{"fieldName": "parentId", "comparator": "EQUALS",
+          "fieldValue": {"type": "STRING", "value": folder_id}}], zone_id=library.zone_id)
+    path.parent.mkdir(exist_ok=True)
+    ids = []
+    source = islice(album, max_items) if max_items else album
+    for asset in source:
+        ids.append(item_key(cat.account, row["zone"], asset.id))
+        if len(ids) % 100 == 0:
+            atomic_json(path, dict(albumId=key, ids=ids, complete=False))
+    atomic_json(path, dict(albumId=key, ids=ids, complete=True,
+                           limited=max_items is not None, limit=max_items))
 
 
 def status(cache, state, message="", count=0):
@@ -373,23 +480,29 @@ def safe_name(name):
     return value if value not in ("", ".", "..") else "unnamed-asset"
 
 
-def download(cat, cfg, key, component="original", api=None):
+def download(cat, cfg, key, component="original", api=None, keep=True):
     with (cat.cache / "download.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _download(cat, cfg, key, component, api)
+        return _download(cat, cfg, key, component, api, keep)
 
 
-def _download(cat, cfg, key, component="original", api=None):
+def _download(cat, cfg, key, component="original", api=None, keep=True):
     with asset_lock(cat.cache, key):
         row = cat.get(key)
+        if not keep and row["auto_excluded"]:
+            return None
         column = "motion" if component == "motion" else "original"
         if row[column] and Path(row[column]).is_file():
+            if keep:
+                with cat.db:
+                    cat.db.execute("UPDATE assets SET keep_offline=1, auto_excluded=0 WHERE id=?", (key,))
+                cat.export()
             return row[column]
         try:
             api = api or cloud(cfg)
             libs = dict(libraries(api, cfg.get("SHARED_LIBRARY", "auto")))
             library = libs[row["zone"]]
-            asset = matching_asset(library, row["record"])
+            asset = catalog_asset(library, row)
             v = version(asset, component)
             name = safe_name(row["name"])
             if component == "motion":
@@ -414,8 +527,8 @@ def _download(cat, cfg, key, component="original", api=None):
                 finally:
                     temp_preview.unlink(missing_ok=True)
             with cat.db:
-                cat.db.execute(f"UPDATE assets SET {column}=?, owned=1, state='downloaded', error=NULL WHERE id=?",
-                               (str(dest), key))
+                cat.db.execute(f"UPDATE assets SET {column}=?, owned=1, keep_offline=CASE WHEN ? THEN 1 ELSE keep_offline END, auto_excluded=0, state='downloaded', error=NULL WHERE id=?",
+                               (str(dest), int(keep), key))
                 if component == "original" and row["kind"] == "video":
                     cat.db.execute("UPDATE assets SET duration=? WHERE id=?", (video_duration(dest), key))
             cat.export()
@@ -428,7 +541,7 @@ def _download(cat, cfg, key, component="original", api=None):
             raise
 
 
-def evict(cat, keys):
+def evict(cat, keys, exclude=True):
     root = (cat.cache / "originals").resolve()
     for key in keys:
         with asset_lock(cat.cache, key):
@@ -443,7 +556,7 @@ def evict(cat, keys):
                         if path.resolve().is_relative_to(root) and path.is_file() and not path.is_symlink():
                             path.unlink()
                 # Derived full-media caches use the same stable key.
-                for folder, suffix in (("videos", ".mp4"), ("previews", ".jpg"), ("wallpaper", ".jpg")):
+                for folder, suffix in (("videos", ".mp4"), ("previews", ".jpg"), ("wallpaper", ".jpg"), ("view-previews", ".jpg")):
                     path = cat.cache / folder / (key + suffix)
                     if path.is_file() and not path.is_symlink():
                         path.unlink()
@@ -461,8 +574,76 @@ def evict(cat, keys):
                     if ours and path.is_file() and not path.is_symlink():
                         path.unlink()
             with cat.db:
-                cat.db.execute("UPDATE assets SET original=NULL, motion=NULL, owned=0, state='cloud-only', error=NULL WHERE id=?", (key,))
+                cat.db.execute("UPDATE assets SET original=NULL, motion=NULL, owned=0, keep_offline=0, auto_excluded=?, state='cloud-only', error=NULL WHERE id=?", (int(exclude), key))
     cat.export()
+
+
+def preview(cat, cfg, key, api=None):
+    """A medium JPEG for the viewer; never use the original as fallback."""
+    with asset_lock(cat.cache, key):
+        row = cat.get(key)
+        if row["kind"] == "video":
+            return None
+        target = cat.cache / "view-previews" / (key + ".jpg")
+        if target.is_file():
+            target.touch()  # Last viewed; expiry is based on actual use.
+            cat.export()
+            return str(target)
+        api = api or cloud(cfg)
+        libs = dict(libraries(api, cfg.get("SHARED_LIBRARY", "auto")))
+        library = libs[row["zone"]]
+        asset = catalog_asset(library, row)
+        try:
+            value = asset.versions.get(AssetVersionSize.MEDIUM)
+        except (KeyError, ValueError, TypeError):
+            value = None
+        if value is None or not any(t in value.type.lower() for t in ("jpeg", "jpg")):
+            return None
+        transfer(asset, library, value, target)
+        cat.export()
+        return str(target)
+
+
+def apply_download_policy(cat, cfg, api=None, limit=12, now=None):
+    """One bounded, newest-first pass. The UI schedules subsequent passes."""
+    options = preferences(cat.cache)
+    if options["mode"] == "manual":
+        unwanted = cat.db.execute("""SELECT id FROM assets WHERE account=? AND owned=1
+            AND keep_offline=0 LIMIT 50""", (cat.account,)).fetchall()
+        if unwanted:
+            evict(cat, [row["id"] for row in unwanted], exclude=False)
+        return 0
+    now = time.time() if now is None else now
+    cutoff = now - options["recent_days"] * 86400 if options["mode"] == "recent" else None
+    if cutoff is not None:
+        old = cat.db.execute("""SELECT id FROM assets WHERE account=? AND owned=1
+            AND keep_offline=0 AND ts<? LIMIT 50""", (cat.account, cutoff)).fetchall()
+        if old:
+            evict(cat, [row["id"] for row in old], exclude=False)
+    rows = cat.db.execute("""SELECT id, kind, original, motion FROM assets WHERE account=?
+        AND state IN ('cloud-only','downloaded')
+        AND (original IS NULL OR original='' OR (kind='live' AND (motion IS NULL OR motion='')))
+        AND auto_excluded=0
+        AND (? IS NULL OR ts>=?) ORDER BY ts DESC, id LIMIT ?""",
+        (cat.account, cutoff, cutoff, limit)).fetchall()
+    if not rows:
+        return 0
+    api = api or cloud(cfg)
+    completed = 0
+    for row in rows:
+        # Settings can change or an explicit eviction can land between items.
+        if preferences(cat.cache)["mode"] != options["mode"]:
+            break
+        try:
+            component = "motion" if row["kind"] == "live" and row["original"] and not row["motion"] else "original"
+            if download(cat, cfg, row["id"], component=component, api=api, keep=False):
+                completed += 1
+        except Exception as exc:
+            print(json.dumps({"state": "failed", "id": row["id"], "error": str(exc)}), flush=True)
+            if isinstance(exc, PyiCloudFailedLoginException) or "session expired" in str(exc):
+                break
+        time.sleep(1)
+    return completed
 
 
 def convert_video(cat, key):
@@ -643,6 +824,7 @@ def sync(cat, cfg, api=None, full=False, max_items=None):
         changed = adopt_legacy(cat, cfg) or changed
     if changed:
         cat.export()
+    refresh_albums(cat, cfg, api)
     return cat.db.execute("SELECT COUNT(*) FROM assets WHERE account=? AND state NOT IN ('deleted','absent')", (cat.account,)).fetchone()[0]
 
 
@@ -706,6 +888,11 @@ def main():
     local_favorite.add_argument("id")
     local_favorite.add_argument("value", type=int, choices=(0, 1))
     get = sub.add_parser("download"); get.add_argument("id"); get.add_argument("--component", choices=("original", "motion"), default="original")
+    pin = sub.add_parser("keep-offline"); pin.add_argument("ids", nargs="+")
+    look = sub.add_parser("preview"); look.add_argument("id")
+    album = sub.add_parser("album-members"); album.add_argument("id")
+    album.add_argument("--max-items", type=int)
+    policy = sub.add_parser("policy"); policy.add_argument("--limit", type=int, default=12)
     remove = sub.add_parser("evict"); remove.add_argument("ids", nargs="+")
     convert = sub.add_parser("convert"); convert.add_argument("ids", nargs="+")
     sub.add_parser("convert-all").add_argument("--force", action="store_true")
@@ -732,6 +919,7 @@ def main():
                     return
                 status(cache, "syncing", "Refreshing catalog")
                 n = sync(cat, cfg, full=args.full, max_items=args.max_items)
+                expire_previews(cat)
                 status(cache, "ok", "", n)
         elif args.command == "export":
             cat.export()
@@ -743,6 +931,25 @@ def main():
             cat.set_local_favorite(args.id, args.value)
         elif args.command == "download":
             download(cat, cfg, args.id, args.component)
+        elif args.command == "keep-offline":
+            with cat.db:
+                for key in args.ids:
+                    row = cat.get(key)
+                    if row["original"] and Path(row["original"]).is_file():
+                        cat.db.execute("UPDATE assets SET keep_offline=1, auto_excluded=0 WHERE id=?", (key,))
+            cat.export()
+        elif args.command == "preview":
+            path = preview(cat, cfg, args.id)
+            print(json.dumps({"preview": path or ""}), flush=True)
+        elif args.command == "album-members":
+            cap = args.max_items
+            if cap is None and os.environ.get("OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS"):
+                cap = int(os.environ["OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS"])
+            load_album_members(cat, cfg, args.id, max_items=cap)
+        elif args.command == "policy":
+            if args.limit < 1 or args.limit > 50:
+                parser.error("--limit must be between 1 and 50")
+            print(json.dumps({"completed": apply_download_policy(cat, cfg, limit=args.limit)}), flush=True)
         elif args.command == "convert":
             for key in args.ids:
                 changed = convert_video(cat, key)
