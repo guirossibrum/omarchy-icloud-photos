@@ -26,6 +26,7 @@ Rectangle {
     ]},
     { title: "Everywhere", keys: [
       ["d  del", "move to Recently Deleted"],
+      ["e", "Remove local download — keep in iCloud"],
       ["u", "undo the last delete"],
       ["o", "open in the default app"],
       ["ctrl + c  y", "copy the image, or the files"],

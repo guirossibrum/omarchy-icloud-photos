@@ -12,6 +12,19 @@
 set -euo pipefail
 umask 077
 
+# The catalog is the normal sync path. Keep the legacy indexer for the
+# isolated demo and its video conversion command.
+script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+catalog_python="$script_dir/../.venv/bin/python"
+if [ ! -x "$catalog_python" ]; then catalog_python=python3; fi
+catalog_config="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-icloud-photos/config"
+if [ "${DEMO:-0}" != 1 ] && ! { [ -f "$catalog_config" ] && grep -Eq '^DEMO=1[[:space:]]*$' "$catalog_config"; }; then
+  case "${1:-}" in
+    ""|--full) exec "$catalog_python" "$script_dir/library_catalog.py" sync "$@" ;;
+    --index-only) exec "$catalog_python" "$script_dir/library_catalog.py" export ;;
+  esac
+fi
+
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-icloud-photos/config"
 [ -f "$CONFIG" ] && . "$CONFIG"
 

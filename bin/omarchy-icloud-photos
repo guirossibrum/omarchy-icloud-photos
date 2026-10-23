@@ -16,4 +16,11 @@ if [ "${1:-}" = "--demo" ]; then
     export OMARCHY_ICLOUD_PHOTOS_TOUR=1
   fi
 fi
+
+# Re-export the selected account before the window opens. This is local-only
+# and prevents a cached index from another account appearing on startup.
+config="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-icloud-photos/config"
+if [ "${DEMO:-0}" != 1 ] && [ -f "$config" ] && ! grep -Eq '^DEMO=1[[:space:]]*$' "$config" && grep -q '^APPLE_ID=' "$config"; then
+  "$dir/bin/omarchy-icloud-photos-catalog" export
+fi
 exec quickshell -p "$dir/ui/shell.qml" "$@"

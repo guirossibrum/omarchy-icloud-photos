@@ -43,12 +43,11 @@ from pyicloud_ipd.exceptions import (
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-icloud-photos" / "config"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy-icloud-photos"
-WALK_LIMIT = 600  # newest assets to inspect when looking for a filename
 TS_TOLERANCE = 180  # seconds between local mtime and iCloud capture time
 
 
 def read_config(require_id=True):
-    cfg = {"COOKIES": str(Path.home() / ".config" / "icloudpd")}
+    cfg = {"COOKIES": str(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "icloudpd")}
     if CONFIG.exists():
         for line in CONFIG.read_text().splitlines():
             line = line.strip()
@@ -101,14 +100,10 @@ def connect(cfg):
 
 
 def find_asset(album, name, ts):
-    """Newest-first walk until the asset with this filename and capture time."""
-    seen = 0
+    """Walk every page for legacy items without a catalog identity."""
     for asset in album:
-        seen += 1
         if asset.filename == name and abs(asset.created.timestamp() - ts) <= TS_TOLERANCE:
             return asset
-        if seen >= WALK_LIMIT:
-            break
     return None
 
 
@@ -130,7 +125,7 @@ def locate(api, name, ts, shared):
         asset = find_asset(library.all, name, ts)
         if asset is not None:
             return zone, library, asset
-    fail("asset not found in the newest items of the " + ("shared" if shared else "personal") + " library")
+    fail("asset not found in the " + ("shared" if shared else "personal") + " library")
 
 
 def library_by_zone(api, zone):
@@ -236,7 +231,7 @@ def cmd_find(args, cfg):
 
 
 def cmd_delete(args, cfg):
-    files = [args.file] + ([args.companion] if args.companion else [])
+    files = ([args.file] if args.file else []) + ([args.companion] if args.companion else [])
     for f in files:
         if not os.path.isfile(f):
             fail(f"not a file: {f}")
@@ -245,9 +240,24 @@ def cmd_delete(args, cfg):
         zone, new_tag = ("demo-shared" if args.shared else "PrimarySync"), ""
     else:
         api = connect(cfg)
-        zone, library, asset = locate(api, os.path.basename(args.file), args.ts, args.shared)
+        if args.record:
+            from library_catalog import account_key, Catalog, libraries, matching_asset
+            # A stable cloud record is scoped to the account and zone in the catalog.
+            cat = Catalog(CACHE, account_key(cfg["APPLE_ID"]))
+            row = cat.get(args.key)
+            if row["record"] != args.record or row["zone"] != args.zone:
+                fail("cloud identity does not match the local catalog")
+            zone = row["zone"]
+            library = dict(libraries(api))[zone]
+            asset = matching_asset(library, row["record"])
+        else:
+            zone, library, asset = locate(api, os.path.basename(args.file), args.ts, args.shared)
         info = describe(asset)
         new_tag = set_deleted(library, info["record"], info["changeTag"], True)
+        if args.record:
+            with cat.db:
+                cat.db.execute("UPDATE assets SET state='deleted' WHERE id=?", (args.key,))
+            cat.export()
 
     trash_dir = CACHE / "trash" / args.key
     trash_dir.mkdir(parents=True, exist_ok=True)
@@ -272,15 +282,16 @@ def cmd_restore(args, cfg):
         # The change tag moves on every edit; look the record up in Recently
         # Deleted for a fresh one and fall back to the tag we saved.
         tag = manifest["changeTag"]
-        seen = 0
         for asset in library.recently_deleted:
-            seen += 1
             if asset._asset_record["recordName"] == manifest["record"]:
                 tag = asset._asset_record["recordChangeTag"]
                 break
-            if seen >= WALK_LIMIT:
-                break
         set_deleted(library, manifest["record"], tag, False)
+        from library_catalog import Catalog, account_key
+        cat = Catalog(CACHE, account_key(cfg["APPLE_ID"]))
+        with cat.db:
+            cat.db.execute("UPDATE assets SET state='cloud-only' WHERE id=?", (args.key,))
+        cat.export()
 
     for src, dest in manifest["files"]:
         if os.path.isfile(dest):
@@ -304,8 +315,9 @@ def main():
     l = sub.add_parser("login"); l.add_argument("--username", required=True); l.add_argument("--save-config", action="store_true")
     f = sub.add_parser("find"); f.add_argument("--file", required=True); f.add_argument("--ts", type=int, required=True)
     f.add_argument("--shared", action="store_true")
-    d = sub.add_parser("delete"); d.add_argument("--key", required=True); d.add_argument("--file", required=True)
-    d.add_argument("--ts", type=int, required=True); d.add_argument("--companion"); d.add_argument("--shared", action="store_true")
+    d = sub.add_parser("delete"); d.add_argument("--key", required=True); d.add_argument("--file")
+    d.add_argument("--ts", type=int); d.add_argument("--companion"); d.add_argument("--shared", action="store_true")
+    d.add_argument("--record"); d.add_argument("--zone")
     r = sub.add_parser("restore"); r.add_argument("--key", required=True)
     args = p.parse_args()
     cfg = read_config(require_id=args.cmd != "login")

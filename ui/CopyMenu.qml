@@ -7,6 +7,7 @@ Menu {
   required property var theme
   property var items: []
   signal requestCopy(var items)
+  signal requestEvict(var items)
 
   width: 260
   padding: 4
@@ -64,5 +65,12 @@ Menu {
         font.pixelSize: root.theme.fontSize - 1
       }
     }
+  }
+
+  MenuItem {
+    text: "Remove local download — keep in iCloud"
+    enabled: root.items.some(function (it) { return it.evictable === true; })
+    implicitHeight: 40
+    onTriggered: root.requestEvict(root.items)
   }
 }

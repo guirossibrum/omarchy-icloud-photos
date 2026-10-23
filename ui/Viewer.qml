@@ -12,6 +12,9 @@ Rectangle {
   // Whether the moving picture is on screen: always for a video, toggled
   // for a Live Photo.
   property bool videoShown: false
+  property string downloadState: ""
+  property string downloadMessage: ""
+  property int downloadPercent: 0
   readonly property bool playing: video.playbackState === MediaPlayer.PlayingState
   readonly property bool hasVideo: item !== null && !!item.video
 
@@ -21,6 +24,9 @@ Rectangle {
   signal requestCopyPath()
   signal requestSave()
   signal requestInfo()
+  signal requestRetry()
+  signal requestCancel()
+  signal requestMotion()
   signal contextMenuRequested(real x, real y)
 
   // Details panel: rows of [label, value] from the info script.
@@ -49,6 +55,7 @@ Rectangle {
   // like pressing the picture on the phone.
   function playLive() {
     if (!item || item.kind !== "live" || videoShown) return;
+    if (!item.video) { requestMotion(); return; }
     videoShown = true;
   }
 
@@ -112,6 +119,38 @@ Rectangle {
     color: theme.darkForeground
     font.family: theme.fontFamily
     font.pixelSize: 28
+  }
+
+  Rectangle {
+    anchors.centerIn: frame
+    z: 10
+    visible: item && (downloadState === "downloading" || downloadState === "failed" || (!item.downloaded && item.state === "cloud-only"))
+    width: 270; height: 108; radius: 8
+    color: theme.darkBackground
+    border.color: theme.lighterBackground
+    Column {
+      anchors.centerIn: parent
+      spacing: 12
+      Text {
+        text: downloadState === "downloading" ? "Downloading original…" + (downloadPercent > 0 ? " " + downloadPercent + "%" : "") :
+              downloadState === "failed" ? (downloadMessage || "Download failed") : "Original in iCloud"
+        color: theme.brightForeground
+        font.family: theme.fontFamily
+        width: 250
+        wrapMode: Text.Wrap
+        horizontalAlignment: Text.AlignHCenter
+      }
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        text: downloadState === "downloading" ? "Cancel" : "Retry download"
+        color: theme.accent
+        font.family: theme.fontFamily
+        MouseArea {
+          anchors.fill: parent
+          onClicked: downloadState === "downloading" ? root.requestCancel() : root.requestRetry()
+        }
+      }
+    }
   }
 
   Video {
@@ -465,6 +504,7 @@ Rectangle {
   }
 
   function longDate(it) {
+    if (!it.captured && it.date === "Unknown") return "Unknown date";
     var d = new Date(it.ts * 1000);
     return d.toLocaleDateString(Qt.locale("en_GB"), "dddd d MMMM yyyy");
   }

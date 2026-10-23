@@ -3,7 +3,7 @@ import QtQuick.Controls.Basic
 import Quickshell
 import Quickshell.Io
 
-// omarchy-icloud-photos: the last week of an iCloud Photos library in one window.
+// omarchy-icloud-photos: an iCloud Photos library in one window.
 //
 // All data comes from bin/omarchy-icloud-photos-sync, which writes index.json and
 // status.json under ~/.cache/omarchy-icloud-photos. This file only renders them and
@@ -23,6 +23,7 @@ ShellRoot {
   readonly property string binDir: Quickshell.shellDir + "/../bin"
   readonly property string syncScript: binDir + "/omarchy-icloud-photos-sync"
   readonly property string helperScript: binDir + "/omarchy-icloud-photos-helper"
+  readonly property string catalogScript: binDir + "/omarchy-icloud-photos-catalog"
   readonly property string infoScript: binDir + "/omarchy-icloud-photos-info"
   readonly property string configPath:
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy-icloud-photos/config"
@@ -30,6 +31,7 @@ ShellRoot {
   property var items: []
   property var days: []          // [{label, indices: [int]}]
   property int selected: -1
+  onSelectedChanged: if (grid && !suppressReveal) grid.revealIndex(selected)
   // OMARCHY_ICLOUD_PHOTOS_TOUR=1: scroll the grid from top to bottom by itself and
   // open one photo at the end. Used to record the demo video.
   readonly property bool tour: Quickshell.env("OMARCHY_ICLOUD_PHOTOS_TOUR") === "1"
@@ -49,7 +51,6 @@ ShellRoot {
   property bool indexMissing: false
   // Apple ID from the config file; empty until the first sign-in.
   property string appleId: ""
-  property int rangeDays: 30
   property bool configLoaded: false
   // The sign-in card shows on first run and whenever the session has expired.
   readonly property bool needLogin: configLoaded && (appleId === "" || status.state === "auth-required")
@@ -77,6 +78,12 @@ ShellRoot {
   property var jobs: []
   property bool undoAfterCurrent: false
   property bool reindexDirty: false
+  property string downloadingId: ""
+  property string downloadingComponent: "original"
+  property int downloadPercent: 0
+  property string downloadError: ""
+  property string failedDownloadId: ""
+  property var afterDownload: null
   readonly property int gap: 8
   readonly property var current: (selected >= 0 && selected < items.length) ? items[selected] : null
 
@@ -151,7 +158,12 @@ ShellRoot {
     path: root.configPath
     watchChanges: true
     printErrors: false
-    onLoaded: { root.appleId = root.parseAppleId(text()); root.rangeDays = root.parseDays(text()); root.configLoaded = true; }
+    onLoaded: {
+      var next = root.parseAppleId(text());
+      if (root.appleId && next !== root.appleId) { root.rebuild([], -1); root.startSync(); }
+      root.appleId = next;
+      root.configLoaded = true;
+    }
     onLoadFailed: { root.appleId = ""; root.configLoaded = true; }
     onFileChanged: reload()
   }
@@ -191,6 +203,103 @@ ShellRoot {
     command: [root.syncScript]
     running: false
     onExited: { indexFile.reload(); statusFile.reload(); }
+  }
+
+  Process {
+    id: originalDownload
+    property string completedPath: ""
+    stdout: SplitParser { onRead: data => root.downloadLine(data) }
+    stderr: StdioCollector {
+      onStreamFinished: {
+        if (!text.trim()) return;
+        try { root.downloadError = JSON.parse(text.trim()).error || "Download failed"; }
+        catch (e) { root.downloadError = "Download failed"; }
+      }
+    }
+    onExited: (code, status) => root.downloadFinished(code)
+  }
+  Process {
+    id: eviction
+    onExited: (code, status) => {
+      indexFile.reload();
+      toast.show(code === 0 ? "Local download removed; copy kept in iCloud" : "Could not remove local download", 3500);
+    }
+  }
+
+  function downloadLine(data) {
+    var event;
+    try { event = JSON.parse(data); } catch (e) { return; }
+    if (event.state === "downloading")
+      downloadPercent = event.total > 0 ? Math.floor(100 * event.received / event.total) : 0;
+    else if (event.state === "downloaded") originalDownload.completedPath = event.path;
+  }
+
+  function downloadFinished(code) {
+    var id = downloadingId, component = downloadingComponent;
+    var path = originalDownload.completedPath, callback = afterDownload;
+    afterDownload = null;
+    downloadingId = "";
+    if (code === 0 && path) {
+      failedDownloadId = "";
+      var list = items.slice();
+      for (var i = 0; i < list.length; i++) if (list[i].id === id) {
+        var it = Object.assign({}, list[i]);
+        if (component === "motion") it.video = path;
+        else { it.path = path; it.preview = /\.(heic|heif|tif|tiff|dng)$/i.test(path) ? it.thumb : path;
+               it.downloaded = true; it.evictable = true; it.state = "downloaded"; if (it.kind === "video") it.video = path; }
+        list[i] = it;
+        break;
+      }
+      items = list;
+      if (infoOpen && current && current.id === id) { infoForId = ""; fetchInfo(); }
+      if (callback) callback();
+    } else {
+      failedDownloadId = id;
+      downloadError = downloadError || "Download stopped. Retry when ready.";
+      toast.show(downloadError, 6000);
+    }
+    indexFile.reload();
+    if (viewerOpen && current && current.id !== id && current.state === "cloud-only" && !originalDownload.running)
+      ensureOriginal(current);
+  }
+
+  function ensureOriginal(it, callback, component) {
+    if (!it) return;
+    component = component || "original";
+    if ((component === "motion" ? it.video : it.path) && it.downloaded) {
+      if (callback) callback();
+      return;
+    }
+    if (originalDownload.running) { toast.show("A download is already running", 2500); return; }
+    downloadingId = it.id;
+    downloadingComponent = component;
+    failedDownloadId = "";
+    downloadError = "";
+    downloadPercent = 0;
+    afterDownload = callback || null;
+    originalDownload.completedPath = "";
+    originalDownload.command = [catalogScript, "download", it.id, "--component", component];
+    originalDownload.running = true;
+  }
+
+  function cancelDownload() {
+    afterDownload = null;
+    if (originalDownload.running) originalDownload.running = false;
+  }
+
+  function ensureMany(list, callback, at) {
+    at = at || 0;
+    if (at >= list.length) { callback(); return; }
+    ensureOriginal(list[at], function () { root.ensureMany(list, callback, at + 1); });
+  }
+
+  function evictLocal(list) {
+    if (!list || list.length === 0 || eviction.running) return;
+    list = list.filter(function (it) { return it.evictable === true; });
+    if (list.length === 0) { toast.show("Existing backup files are preserved", 3500); return; }
+    if (originalDownload.running) cancelDownload();
+    eviction.command = [catalogScript, "evict"].concat(list.map(function (it) { return it.id; }));
+    eviction.running = true;
   }
 
   Process { id: opener }
@@ -301,6 +410,7 @@ ShellRoot {
   }
 
   function dayLabel(it) {
+    if (!it.captured && it.date === "Unknown") return "Unknown date";
     var d = new Date(it.ts * 1000);
     var today = new Date(); today.setHours(0, 0, 0, 0);
     var day = new Date(d); day.setHours(0, 0, 0, 0);
@@ -311,18 +421,8 @@ ShellRoot {
     return s.charAt(0).toUpperCase() + s.slice(1);
   }
 
-  function parseDays(raw) {
-    var m = String(raw || "").match(/^\s*DAYS=["']?(\d+)/m);
-    return m ? parseInt(m[1]) : 30;
-  }
-
   function rangeLabel() {
-    var d = rangeDays;
-    if (d === 7) return "last week";
-    if (d === 14) return "last two weeks";
-    if (d >= 28 && d <= 31) return "last month";
-    if (d >= 89 && d <= 93) return "last three months";
-    return "last " + d + " days";
+    return "full library";
   }
 
   function parseAppleId(raw) {
@@ -447,8 +547,12 @@ ShellRoot {
 
   function openCurrent() {
     if (!current) return;
-    opener.command = ["xdg-open", current.kind === "video" ? current.video : current.path];
-    opener.running = true;
+    var id = current.id;
+    ensureOriginal(current, function () {
+      var it = root.items.find(function (x) { return x.id === id; });
+      opener.command = ["xdg-open", it.kind === "video" ? it.video : it.path];
+      opener.running = true;
+    });
   }
 
   function copyTargets() {
@@ -473,6 +577,8 @@ ShellRoot {
     if (copier.running) return;
     if (!list) list = copyTargets();
     if (list.length === 0) return;
+    var pending = list.filter(function (it) { return it.state !== undefined && !it.downloaded; });
+    if (pending.length) { ensureMany(pending, function () { root.copyCurrent(); }); return; }
     if (list.length > 1) {
       // A list of files: file managers paste them as copies, chat apps as
       // attachments. Plain text gets the paths, one per line.
@@ -485,7 +591,7 @@ ShellRoot {
     var it = list[0];
     // A video copies as the video. A Live Photo is a still that happens to
     // move, so that one copies as its picture, like it does everywhere else.
-    var src = it.kind === "video" ? it.video : it.preview;
+    var src = it.kind === "video" ? it.video : (it.state !== undefined ? it.path : it.preview);
     copier.command = [binDir + "/omarchy-icloud-photos-copy", src];
     copier.successMessage = "Copied image to clipboard";
     toast.show("Copying image…", 30000);
@@ -499,6 +605,8 @@ ShellRoot {
   function saveToDownloads() {
     var list = targets();
     if (list.length === 0) return;
+    var pending = list.filter(function (it) { return it.state !== undefined && !it.downloaded; });
+    if (pending.length) { ensureMany(pending, function () { root.saveToDownloads(); }); return; }
     var args = [];
     for (var i = 0; i < list.length; i++) {
       var it = list[i];
@@ -527,6 +635,10 @@ ShellRoot {
   // a full-size JPEG in the cache, since the shell cannot decode HEIC.
   function setWallpaper() {
     if (!current || current.kind === "video") return;
+    if (current.state !== undefined && !current.downloaded) {
+      ensureOriginal(current, function () { root.setWallpaper(); });
+      return;
+    }
     var it = current;
     wallpaper.command = ["bash", "-c", '
       src="$1"; cache="$2"; key="$3"
@@ -550,19 +662,42 @@ ShellRoot {
   function fetchInfo() {
     if (!current || infoProc.running) return;
     if (infoForId === current.id) return;
+    if (current.state !== undefined && !current.path) {
+      var rows = [];
+      if (current.shared) rows.push(["Library", "Shared"]);
+      if (current.camera) rows.push(["Camera", current.camera]);
+      if (current.width && current.height) rows.push(["Size", current.width + " × " + current.height]);
+      if (current.location) rows.push(["Location", JSON.stringify(current.location)]);
+      if (current.captured) rows.push(["Captured", current.captured]);
+      if (current.timezone) rows.push(["Time zone", String(current.timezone)]);
+      rows.push(["File", current.name]);
+      infoRows = rows;
+      infoForId = current.id;
+      return;
+    }
     infoRows = [];
     infoProc.forId = current.id;
     infoProc.command = [root.infoScript, current.kind === "video" ? current.path : current.path];
     infoProc.running = true;
   }
 
-  onCurrentChanged: if (infoOpen && viewerOpen) fetchInfo()
-  onViewerOpenChanged: if (!viewerOpen) infoOpen = false
+  onCurrentChanged: {
+    if (infoOpen && viewerOpen) fetchInfo();
+    if (current && current.id !== failedDownloadId && !originalDownload.running) downloadError = "";
+    if (viewerOpen && current && current.state === "cloud-only" && !current.downloaded && !originalDownload.running && current.id !== failedDownloadId)
+      ensureOriginal(current);
+  }
+  onViewerOpenChanged: {
+    if (!viewerOpen) infoOpen = false;
+    else if (current && current.state !== undefined && !current.downloaded) ensureOriginal(current);
+  }
 
   function copyPath() {
     if (copier.running) return;
     var list = targets();
     if (list.length === 0) return;
+    var pending = list.filter(function (it) { return it.state !== undefined && !it.downloaded; });
+    if (pending.length) { ensureMany(pending, function () { root.copyPath(); }); return; }
     var paths = list.map(function (it) { return it.path; });
     copier.command = ["bash", "-c", 'printf "%s\n" "$@" | wl-copy', "_"].concat(paths);
     copier.successMessage = list.length === 1 ? "Copied " + paths[0] : "Copied " + list.length + " paths";
@@ -639,7 +774,10 @@ ShellRoot {
     trash.action = job.action;
     trash.subject = it;
     if (job.action === "delete") {
-      var cmd = [root.helperScript, "delete", "--key", it.id, "--file", it.path, "--ts", String(it.ts)];
+      var cmd = [root.helperScript, "delete", "--key", it.id];
+      if (it.path) cmd.push("--file", it.path);
+      if (it.ts) cmd.push("--ts", String(it.ts));
+      if (it.record) cmd.push("--record", it.record, "--zone", it.zone);
       if (it.kind === "live" && it.video) cmd.push("--companion", it.video);
       if (it.shared) cmd.push("--shared");
       trash.command = cmd;
@@ -810,6 +948,7 @@ ShellRoot {
         id: copyMenu
         theme: appTheme
         onRequestCopy: items => root.copyCurrent(items)
+        onRequestEvict: items => root.evictLocal(items)
         onClosed: keys.forceActiveFocus()
       }
 
@@ -834,6 +973,7 @@ ShellRoot {
         if (t === "d" || k === Qt.Key_Delete) { root.askDelete(); event.accepted = true; return; }
         if (t === "u") { root.undoDelete(); event.accepted = true; return; }
         if (t === "s") { root.saveToDownloads(); event.accepted = true; return; }
+        if (t === "e") { root.evictLocal(root.targets()); event.accepted = true; return; }
         if (t === "W") { root.setWallpaper(); event.accepted = true; return; }
         if (ctrl && k === Qt.Key_A) { root.checkAll(); event.accepted = true; return; }
         // x, or ctrl+space, ticks the item under the cursor like a ctrl-click.
@@ -850,7 +990,11 @@ ShellRoot {
           else if (shift && k === Qt.Key_Right && viewer.videoShown) viewer.seekBy(5000)
           else if (k === Qt.Key_Left || t === "h" || t === "k" || k === Qt.Key_Up) root.move(-1)
           else if (k === Qt.Key_Right || t === "l" || t === "j" || k === Qt.Key_Down) root.move(1)
-          else if (k === Qt.Key_Space) viewer.togglePlay()
+          else if (k === Qt.Key_Space) {
+            if (root.current && root.current.kind === "live" && !root.current.video)
+              root.ensureOriginal(root.current, function () { viewer.togglePlay(); }, "motion");
+            else viewer.togglePlay();
+          }
           else if (t === "o") root.openCurrent()
           else if (t === "y") root.copyCurrent()
           else if (t === "Y") root.copyPath()
@@ -1156,6 +1300,29 @@ ShellRoot {
           }
         }
 
+        // Day sections keep their calculated height, but thumbnails are only
+        // instantiated near the viewport. Keyboard jumps can still reveal a
+        // selected item before its section's Loader becomes active.
+        function revealIndex(index) {
+          if (index < 0 || root.pinBottom || root.suppressReveal) return;
+          for (var d = 0; d < root.days.length; d++) {
+            var pos = root.days[d].indices.indexOf(index);
+            if (pos < 0) continue;
+            var section = daysRepeater.itemAt(d);
+            if (!section) return;
+            var point = section.mapToItem(grid.contentItem, 0, 0);
+            var top = point.y + section.labelHeight + 10 + Math.floor(pos / columns) * (cellFit + root.gap);
+            var target = contentY;
+            if (top - 44 < contentY) target = Math.max(0, top - 44);
+            else if (top + cellFit + 16 > contentY + height)
+              target = Math.min(contentHeight - height, top + cellFit + 16 - height);
+            if (target !== contentY) {
+              scrollAnim.stop(); scrollAnim.from = contentY; scrollAnim.to = target; scrollAnim.start();
+            }
+            return;
+          }
+        }
+
         Column {
           id: column
           x: 20
@@ -1164,13 +1331,17 @@ ShellRoot {
           spacing: 22
 
           Repeater {
+            id: daysRepeater
             model: root.days
             delegate: Column {
+              id: dayBlock
               required property var modelData
+              readonly property real labelHeight: dayTitle.implicitHeight
               width: column.width
               spacing: 10
 
               Text {
+                id: dayTitle
                 text: modelData.label + "  "
                 color: appTheme.brightForeground
                 font.family: appTheme.fontFamily
@@ -1186,32 +1357,34 @@ ShellRoot {
                 }
               }
 
-              Flow {
+              Loader {
                 width: parent.width
-                spacing: root.gap
-                Repeater {
-                  model: modelData.indices
-                  delegate: Thumb {
-                    required property int modelData
-                    index: modelData
-                    item: root.items[modelData]
-                    theme: appTheme
-                    size: grid.cellFit
-                    selected: root.selected === modelData
-                    // items[] can be a step behind the model while a delete
-                    // rebuilds the grid, hence the guard.
-                    checked: !!root.items[modelData] && root.checked[root.items[modelData].id] === true
-                    onSelectedChanged: if (selected) grid.reveal(this)
-                    onContextMenuRequested: (x, y) => root.showCopyMenu(this, x, y, index)
-                    // Click selects, a click on the selected one opens.
-                    // Shift-click checks the range from the anchor, ctrl-click
-                    // toggles one.
-                    onClicked: modifiers => {
-                      root.pinBottom = false;
-                      if (modifiers & Qt.ShiftModifier) root.jumpTo(index, true);
-                      else if (modifiers & Qt.ControlModifier) { root.selected = index; root.toggleChecked(index); }
-                      else if (root.selected === index && root.checkedCount === 0) root.viewerOpen = true;
-                      else root.jumpTo(index, false);
+                height: Math.ceil(modelData.indices.length / grid.columns) * (grid.cellFit + root.gap) - root.gap
+                active: dayBlock.y + column.y + height >= grid.contentY - grid.height &&
+                        dayBlock.y + column.y <= grid.contentY + 2 * grid.height
+                sourceComponent: Flow {
+                  width: dayBlock.width
+                  spacing: root.gap
+                  Repeater {
+                    model: dayBlock.modelData.indices
+                    delegate: Thumb {
+                      required property int modelData
+                      index: modelData
+                      item: root.items[modelData]
+                      downloading: !!root.items[modelData] && root.downloadingId === root.items[modelData].id
+                      theme: appTheme
+                      size: grid.cellFit
+                      selected: root.selected === modelData
+                      checked: !!root.items[modelData] && root.checked[root.items[modelData].id] === true
+                      onSelectedChanged: if (selected) grid.reveal(this)
+                      onContextMenuRequested: (x, y) => root.showCopyMenu(this, x, y, index)
+                      onClicked: modifiers => {
+                        root.pinBottom = false;
+                        if (modifiers & Qt.ShiftModifier) root.jumpTo(index, true);
+                        else if (modifiers & Qt.ControlModifier) { root.selected = index; root.toggleChecked(index); }
+                        else if (root.selected === index && root.checkedCount === 0) root.viewerOpen = true;
+                        else root.jumpTo(index, false);
+                      }
                     }
                   }
                 }
@@ -1231,7 +1404,7 @@ ShellRoot {
         visible: root.items.length === 0 && !root.needLogin
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
-          text: root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No photos in the " + root.rangeLabel().replace("last ", "last "))
+          text: root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No photos in the library")
           color: appTheme.foreground
           font.family: appTheme.fontFamily
           font.pixelSize: 16
@@ -1366,6 +1539,10 @@ ShellRoot {
         anchors.fill: parent
         theme: appTheme
         item: root.viewerOpen ? root.current : null
+        downloadState: root.current && root.current.id === root.downloadingId ? "downloading" :
+                       root.current && root.current.state === "failed" ? "failed" : ""
+        downloadMessage: root.downloadError || (root.current ? root.current.error : "")
+        downloadPercent: root.downloadPercent
         infoOpen: root.infoOpen
         infoRows: (root.current && root.infoForId === root.current.id) ? root.infoRows : []
         onRequestInfo: root.toggleInfo()
@@ -1373,6 +1550,9 @@ ShellRoot {
         onRequestPrev: root.move(-1)
         onRequestCopyPath: root.copyPath()
         onRequestSave: root.saveToDownloads()
+        onRequestRetry: if (root.current) root.ensureOriginal(root.current)
+        onRequestCancel: root.cancelDownload()
+        onRequestMotion: if (root.current) root.ensureOriginal(root.current, function () { viewer.playLive(); }, "motion")
         onContextMenuRequested: (x, y) => root.showCopyMenu(viewer, x, y, -1)
       }
 

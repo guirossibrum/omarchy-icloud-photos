@@ -14,6 +14,7 @@ Rectangle {
   property real size: 176
   property bool selected: false
   property bool checked: false
+  property bool downloading: false
 
   signal clicked(int modifiers)
   signal contextMenuRequested(real x, real y)
@@ -26,6 +27,7 @@ Rectangle {
   border.color: selected ? theme.accent : Qt.darker(theme.accent, 1.4)
 
   Image {
+    id: thumbnail
     anchors.fill: parent
     anchors.margins: (root.selected || root.checked) ? 3 : 0
     source: item ? "file://" + item.thumb : ""
@@ -34,6 +36,34 @@ Rectangle {
     sourceSize.width: 400
     sourceSize.height: 400
     smooth: true
+  }
+
+  Text {
+    anchors.centerIn: parent
+    visible: thumbnail.status !== Image.Ready
+    text: "No thumbnail"
+    color: theme.foreground
+    font.family: theme.fontFamily
+    font.pixelSize: 12
+  }
+
+  Rectangle {
+    anchors.right: parent.right
+    anchors.bottom: parent.bottom
+    anchors.margins: 8
+    visible: !!item && item.state !== undefined
+    width: stateLabel.implicitWidth + 12
+    height: 20
+    radius: 4
+    color: Qt.rgba(0, 0, 0, 0.7)
+    Text {
+      id: stateLabel
+      anchors.centerIn: parent
+      text: item ? (root.downloading ? "Downloading" : item.state === "downloaded" ? "Downloaded" : item.state === "failed" ? "Failed" : "In iCloud") : ""
+      color: "white"
+      font.family: theme.fontFamily
+      font.pixelSize: 10
+    }
   }
 
   function fmtDuration(s) {
