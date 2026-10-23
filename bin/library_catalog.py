@@ -9,6 +9,7 @@ import contextlib
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -380,9 +381,17 @@ def sync(cat, cfg, api=None, full=False):
     now = int(time.time())
     count = 0
     changed = not (cat.cache / "index.json").is_file()
+    # Publish the first cards quickly, then grow the batches to avoid
+    # repeatedly rebuilding a large index in the viewer.
+    next_publish = 30
+    publish_step = 30
+    last_publish_at = time.monotonic()
+    thumbnail_libraries = []
     for zone, library in libraries(api, cfg.get("SHARED_LIBRARY", "auto")):
         last = cat.db.execute("SELECT full_at FROM scans WHERE account=? AND zone=?", (cat.account, zone)).fetchone()
         whole = full or last is None or now - last[0] > 7 * 86400
+        zone_count = 0
+        needs_thumbnails = False
         # The pyicloud iterator performs complete offset pagination. On routine
         # runs, stop after two full pages of already known records.
         known_streak = 0
@@ -394,22 +403,21 @@ def sync(cat, cfg, api=None, full=False):
                 changed = True
             cat.upsert(data, now)
             known_streak = known_streak + 1 if existed else 0
-            row = cat.get(data["id"])
-            thumb = cat.cache / "thumbs" / (data["id"] + ".jpg")
-            if not thumb.is_file():
-                thumb_version = thumbnail_version(asset)
-                if thumb_version is not None:
-                    try:
-                        transfer(asset, library, thumb_version, thumb)
-                    except Exception:
-                        pass  # Placeholder remains; never fall back to original.
-            if thumb.is_file() and row["thumb"] != str(thumb):
-                cat.db.execute("UPDATE assets SET thumb=? WHERE id=?", (str(thumb), data["id"]))
-                changed = True
             count += 1
-            if count % 100 == 0:
+            zone_count += 1
+            thumb = cat.cache / "thumbs" / (data["id"] + ".jpg")
+            if not thumb.is_file() or previous is None or previous["thumb"] != str(thumb):
+                needs_thumbnails = True
+            if count >= next_publish or time.monotonic() - last_publish_at >= 5:
                 cat.db.commit()
-                status(cat.cache, "syncing", "Refreshing catalog", count)
+                if changed:
+                    cat.export()
+                    changed = False
+                status(cat.cache, "syncing", "Finding photos", count)
+                last_publish_at = time.monotonic()
+                if count >= next_publish:
+                    publish_step = min(publish_step * 2, 2000)
+                    next_publish += publish_step
             if not whole and known_streak >= 200:
                 break
         with cat.db:
@@ -419,6 +427,50 @@ def sync(cat, cfg, api=None, full=False):
                 changed = True
                 cat.db.execute("INSERT INTO scans VALUES (?,?,?) ON CONFLICT(account,zone) DO UPDATE SET full_at=excluded.full_at",
                                (cat.account, zone, now))
+        # A fresh iterator is used after metadata discovery. It obtains fresh
+        # thumbnail URLs and keeps cloud asset objects out of long-lived memory.
+        if needs_thumbnails:
+            thumbnail_libraries.append((zone, library, zone_count))
+    cat.db.commit()
+    if changed:
+        cat.export()
+        changed = False
+    status(cat.cache, "syncing", f"Loading thumbnails (0/{count})")
+    thumbnails = 0
+    next_thumb_publish = 20
+    thumb_step = 20
+    last_thumb_publish_at = time.monotonic()
+    for zone, library, zone_count in thumbnail_libraries:
+        for asset in islice(library.all, zone_count):
+            key = item_key(cat.account, zone, asset.id)
+            try:
+                row = cat.get(key)
+            except ValueError:
+                # The cloud library can change between the metadata and
+                # thumbnail passes. The next sync will catalog new records.
+                continue
+            thumb = cat.cache / "thumbs" / (key + ".jpg")
+            if not thumb.is_file():
+                thumb_version = thumbnail_version(asset)
+                if thumb_version is not None:
+                    try:
+                        transfer(asset, library, thumb_version, thumb)
+                    except Exception:
+                        pass  # Placeholder remains; never fall back to original.
+            if thumb.is_file() and row["thumb"] != str(thumb):
+                cat.db.execute("UPDATE assets SET thumb=? WHERE id=?", (str(thumb), key))
+                changed = True
+            thumbnails += 1
+            if thumbnails >= next_thumb_publish or time.monotonic() - last_thumb_publish_at >= 5:
+                cat.db.commit()
+                if changed:
+                    cat.export()
+                    changed = False
+                status(cat.cache, "syncing", f"Loading thumbnails ({thumbnails}/{count})")
+                last_thumb_publish_at = time.monotonic()
+                if thumbnails >= next_thumb_publish:
+                    thumb_step = min(thumb_step * 2, 2000)
+                    next_thumb_publish += thumb_step
     cat.db.commit()
     if cat.db.execute("SELECT 1 FROM scans WHERE account=?", (cat.account,)).fetchone():
         changed = adopt_legacy(cat, cfg) or changed

@@ -15,6 +15,7 @@ Rectangle {
   property bool selected: false
   property bool checked: false
   property bool downloading: false
+  property bool syncing: false
 
   signal clicked(int modifiers)
   signal contextMenuRequested(real x, real y)
@@ -41,7 +42,7 @@ Rectangle {
   Text {
     anchors.centerIn: parent
     visible: thumbnail.status !== Image.Ready
-    text: "No thumbnail"
+    text: root.syncing ? "Loading thumbnail…" : "No thumbnail"
     color: theme.foreground
     font.family: theme.fontFamily
     font.pixelSize: 12

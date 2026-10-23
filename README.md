@@ -146,7 +146,7 @@ A click selects, a second click on the selected item opens it. Hovering does not
 | `XDG_CACHE_HOME` | `~/.cache` | The app uses its `omarchy-icloud-photos` subdirectory for SQLite, thumbnails, derived previews and app-owned originals |
 | `LAUNCHER_NAME` | `Omarchy iCloud Photos` | What the app is called in the launcher; re-run `install.sh` after changing it |
 
-The first sync pages through every accessible asset and can take time for a large library. Routine syncs scan the newest records, with a complete reconciliation at least weekly or on `omarchy-icloud-photos-sync --full`. An interrupted initial scan starts again safely; completed catalog rows and thumbnails remain. Original files are fetched only by explicit item actions.
+The first sync pages through every accessible asset and can take time for a large library. It publishes the first cards after 30 records, then in growing batches or after five seconds. Cards initially show placeholders; a second pass fills in thumbnails without blocking catalog discovery. Routine syncs scan the newest records, with a complete reconciliation at least weekly or on `omarchy-icloud-photos-sync --full`. An interrupted initial scan starts again safely; completed catalog rows and thumbnails remain. Original files are fetched only by explicit item actions.
 
 The same session also works from the command line, for a headless box or when you prefer a terminal:
 

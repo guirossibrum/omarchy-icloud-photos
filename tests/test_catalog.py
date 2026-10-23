@@ -1,5 +1,6 @@
 """Synthetic cloud contract tests. These never authenticate or touch a live account."""
 import importlib.util
+import json
 from pathlib import Path
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -106,7 +107,7 @@ class CatalogTests(unittest.TestCase):
     def test_full_sync_pagination_thumbnail_only_and_shared_identity(self):
         count = catalog.sync(self.cat, self.cfg, self.api)
         self.assertEqual(count, 652)
-        self.assertEqual(self.personal.pages, 7)
+        self.assertEqual(self.personal.pages, 14)  # metadata, then fresh thumbnail URLs
         self.assertEqual(self.cat.db.execute("SELECT COUNT(*) FROM assets").fetchone()[0], 652)
         self.assertTrue(self.cat.get(catalog.item_key(self.cat.account, "PrimarySync", "p649"))["ts"] < 1700000000 - 30 * 86400)
         self.assertNotEqual(catalog.item_key(self.cat.account, "PrimarySync", "p0"),
@@ -118,6 +119,30 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(missing["thumb"])
         self.assertIsNone(missing["location"])
         self.assertIsNone(missing["timezone"])
+
+    def test_first_sync_publishes_cards_before_thumbnail_requests(self):
+        exports = []
+        first_transfer = []
+        real_export = self.cat.export
+        real_transfer = catalog.transfer
+
+        def record_export():
+            count = real_export()
+            exports.append(count)
+            return count
+
+        def record_transfer(*args, **kwargs):
+            if not first_transfer:
+                first_transfer.append(json.loads((self.cache / "index.json").read_text()))
+            return real_transfer(*args, **kwargs)
+
+        with patch.object(self.cat, "export", side_effect=record_export), \
+             patch.object(catalog, "transfer", side_effect=record_transfer):
+            catalog.sync(self.cat, self.cfg, self.api)
+        self.assertEqual(exports[0], 30)
+        self.assertTrue(any(30 < count < 652 for count in exports))
+        self.assertEqual(len(first_transfer[0]), 652)
+        self.assertTrue(all(not item["downloaded"] and not item["thumb"] for item in first_transfer[0]))
 
     def test_video_and_missing_poster_never_fetch_small_movie(self):
         video = self.shared.assets[0]

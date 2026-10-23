@@ -472,7 +472,7 @@ ShellRoot {
   function syncedLabel() {
     if (busy) {
       // The sync script says what it is doing; the count grows as files land.
-      var what = status.state === "indexing" ? (status.message || "Building thumbnails") : "Syncing";
+      var what = status.message || (status.state === "indexing" ? "Building thumbnails" : "Syncing");
       var n = status.count > 0 ? "  " + status.count : "";
       return what + "…" + n;
     }
@@ -1382,6 +1382,7 @@ ShellRoot {
                       index: modelData
                       item: root.items[modelData]
                       downloading: !!root.items[modelData] && root.downloadingId === root.items[modelData].id
+                      syncing: root.busy
                       theme: appTheme
                       size: grid.cellFit
                       selected: root.selected === modelData
