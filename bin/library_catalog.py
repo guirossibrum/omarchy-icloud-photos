@@ -388,7 +388,7 @@ def on_ac():
     return not supplies or any(path.read_text().strip() == "1" for path in supplies if path.is_file())
 
 
-def sync(cat, cfg, api=None, full=False):
+def sync(cat, cfg, api=None, full=False, max_items=None):
     api = api or cloud(cfg)
     now = int(time.time())
     count = 0
@@ -400,14 +400,19 @@ def sync(cat, cfg, api=None, full=False):
     last_publish_at = time.monotonic()
     thumbnail_libraries = []
     for zone, library in libraries(api, cfg.get("SHARED_LIBRARY", "auto")):
+        if max_items is not None and count >= max_items:
+            break
         last = cat.db.execute("SELECT full_at FROM scans WHERE account=? AND zone=?", (cat.account, zone)).fetchone()
-        whole = full or last is None or now - last[0] > 7 * 86400
+        # A capped preview is never a complete scan: it must not mark unseen
+        # records absent or make the next normal sync skip older pages.
+        whole = max_items is None and (full or last is None or now - last[0] > 7 * 86400)
         zone_count = 0
         needs_thumbnails = False
         # The pyicloud iterator performs complete offset pagination. On routine
         # runs, stop after two full pages of already known records.
         known_streak = 0
-        for asset in library.all:
+        source = islice(library.all, max_items - count) if max_items is not None else library.all
+        for asset in source:
             data = metadata(asset, cat.account, zone)
             previous = cat.db.execute("SELECT * FROM assets WHERE id=?", (data["id"],)).fetchone()
             existed = previous is not None
@@ -430,7 +435,7 @@ def sync(cat, cfg, api=None, full=False):
                 if count >= next_publish:
                     publish_step = min(publish_step * 2, 2000)
                     next_publish += publish_step
-            if not whole and known_streak >= 200:
+            if max_items is None and not whole and known_streak >= 200:
                 break
         with cat.db:
             if whole:
@@ -541,13 +546,24 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("sync").add_argument("--full", action="store_true")
+    scan = sub.add_parser("sync")
+    scan.add_argument("--full", action="store_true")
+    scan.add_argument("--max-items", type=int, help="preview at most this many cloud records without marking a full scan")
     sub.add_parser("export")
     get = sub.add_parser("download"); get.add_argument("id"); get.add_argument("--component", choices=("original", "motion"), default="original")
     remove = sub.add_parser("evict"); remove.add_argument("ids", nargs="+")
     convert = sub.add_parser("convert"); convert.add_argument("ids", nargs="+")
     sub.add_parser("convert-all").add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.command == "sync" and args.max_items is None:
+        preview_cap = os.environ.get("OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS")
+        if preview_cap:
+            try:
+                args.max_items = int(preview_cap)
+            except ValueError:
+                parser.error("OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS must be a positive integer")
+    if args.command == "sync" and args.max_items is not None and args.max_items < 1:
+        parser.error("--max-items must be positive")
     cfg = read_config()
     cfg.setdefault("COOKIES", str(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "icloudpd"))
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy-icloud-photos"
@@ -560,7 +576,7 @@ def main():
                 except BlockingIOError:
                     return
                 status(cache, "syncing", "Refreshing catalog")
-                n = sync(cat, cfg, full=args.full)
+                n = sync(cat, cfg, full=args.full, max_items=args.max_items)
                 status(cache, "ok", "", n)
         elif args.command == "export":
             cat.export()

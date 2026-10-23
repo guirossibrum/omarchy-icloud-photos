@@ -190,6 +190,15 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(first_transfer[0]), 652)
         self.assertTrue(all(not item["downloaded"] and not item["thumb"] for item in first_transfer[0]))
 
+    def test_capped_preview_keeps_future_full_scan_available(self):
+        count = catalog.sync(self.cat, self.cfg, self.api, max_items=120)
+        self.assertEqual(count, 120)
+        self.assertEqual(len(json.loads((self.cache / "index.json").read_text())), 120)
+        self.assertEqual(self.cat.db.execute("SELECT COUNT(*) FROM scans").fetchone()[0], 0)
+        self.assertEqual(self.cat.db.execute("SELECT COUNT(*) FROM assets WHERE original IS NOT NULL").fetchone()[0], 0)
+        self.assertTrue(all(url.startswith("thumb:") for url in self.personal.session.calls))
+        self.assertEqual(catalog.sync(self.cat, self.cfg, self.api), 652)
+
     def test_video_and_missing_poster_never_fetch_small_movie(self):
         video = self.shared.assets[0]
         video.filename = "fabricated.mov"

@@ -64,6 +64,7 @@ Apple does not make an iCloud Photos client for Linux. This app keeps a local ca
 - **Signs in by itself.** Apple ID, password and the two-factor code go into the window on first run and whenever the session expires. The password is only used to open the session and is never stored.
 - **Wallpaper.** `W` makes the current photo the Omarchy background, HEIC included.
 - **Stays in sync.** A systemd user timer pulls new items every 30 minutes. An open window picks them up on its own.
+- **Bounded previews.** `bin/omarchy-icloud-photos-sync --max-items 200` catalogs only the first 200 cloud records and their thumbnails. It does not mark the scan complete or remove unseen records. Set `OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS=200` for a preview window so its Sync button uses the same cap.
 - **Follows your theme.** Colours come live from Omarchy's `colors.toml`; switch themes and the window switches with you.
 
 ## A look around
