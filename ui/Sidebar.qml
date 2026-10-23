@@ -8,8 +8,27 @@ Rectangle {
   property bool mediaExpanded: true
   property bool albumsExpanded: true
   property var albumRows: []
+  property var expandedFolders: ({})
   signal sectionSelected(string section)
   signal toggleRequested()
+  function visibleAlbums() {
+    var rows = [];
+    for (var i = 0; i < albumRows.length; i++) {
+      var row = albumRows[i], parent = row.parent, visible = true, hops = 0;
+      while (parent && hops++ < albumRows.length) {
+        if (expandedFolders[parent] !== true) { visible = false; break; }
+        var ancestor = albumRows.find(function (entry) { return entry.id === parent; });
+        parent = ancestor ? ancestor.parent : null;
+      }
+      if (visible) rows.push(row);
+    }
+    return rows;
+  }
+  function toggleFolder(id) {
+    var next = Object.assign({}, expandedFolders);
+    next[id] = next[id] !== true;
+    expandedFolders = next;
+  }
 
   color: theme.darkBackground
   readonly property var photoRows: [
@@ -98,22 +117,27 @@ Rectangle {
       }
       Rectangle {
         x: 8; width: parent.width - 16; height: 33; radius: 7
-        color: albumsArea.containsMouse ? Qt.lighter(theme.darkBackground, 1.25) : "transparent"
+        color: root.section === "albums" ? Qt.lighter(theme.darkBackground, 1.55) :
+               albumsArea.containsMouse ? Qt.lighter(theme.darkBackground, 1.25) : "transparent"
         Text { x: 8; anchors.verticalCenter: parent.verticalCenter; text: root.albumsExpanded ? "⌄" : "›"; color: theme.darkForeground; font.pixelSize: 16 }
         Text { x: 39; anchors.verticalCenter: parent.verticalCenter; text: "\uf07b"; color: theme.accent; font.family: theme.fontFamily; font.pixelSize: 16 }
         Text { x: 70; anchors.verticalCenter: parent.verticalCenter; text: "Albums"; color: theme.brightForeground; font.family: theme.fontFamily; font.pixelSize: theme.fontSize }
-        MouseArea { id: albumsArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.albumsExpanded = !root.albumsExpanded }
+        MouseArea { id: albumsArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.sectionSelected("albums") }
+        MouseArea { x: 0; width: 31; height: parent.height; cursorShape: Qt.PointingHandCursor; onClicked: root.albumsExpanded = !root.albumsExpanded }
       }
       Repeater {
-        model: root.albumsExpanded ? root.albumRows : []
+        model: root.albumsExpanded ? root.visibleAlbums() : []
         delegate: SidebarEntry {
           required property var modelData
           theme: root.theme
           label: modelData.title
-          icon: "\uf07c"
-          indent: 16
-          selected: root.section === "album:" + modelData.id
-          onActivated: root.sectionSelected("album:" + modelData.id)
+          icon: modelData.isFolder ? "\uf07b" : "\uf03e"
+          indent: 16 + Math.min(modelData.depth || 0, 7) * 13
+          expandable: modelData.isFolder
+          expanded: root.expandedFolders[modelData.id] === true
+          selected: root.section === (modelData.isFolder ? "folder:" : "album:") + modelData.id
+          onExpansionRequested: root.toggleFolder(modelData.id)
+          onActivated: root.sectionSelected((modelData.isFolder ? "folder:" : "album:") + modelData.id)
         }
       }
       Rectangle {

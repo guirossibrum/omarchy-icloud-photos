@@ -6,8 +6,8 @@ import Quickshell.Io
 // omarchy-icloud-photos: an iCloud Photos library in one window.
 //
 // All data comes from bin/omarchy-icloud-photos-sync, which writes index.json and
-// status.json under ~/.cache/omarchy-icloud-photos. This file only renders them and
-// can ask the script to run again. Nothing here writes to the library.
+// status.json under ~/.cache/omarchy-icloud-photos. Explicit user actions invoke
+// the catalog/helper commands for album changes, favorites, and cloud deletion.
 ShellRoot {
   id: root
 
@@ -33,6 +33,14 @@ ShellRoot {
   property var days: []          // [{label, indices: [int]}]
   property string activeSection: "library"
   property var albumRows: []
+  property var coverAttempted: ({})
+  property bool demoMode: false
+  property string albumAction: ""
+  property string albumActionTarget: ""
+  property var albumActionItems: []
+  property string pendingAlbumDeleteId: ""
+  property bool pendingAlbumDeleteFolder: false
+  readonly property bool folderView: activeSection === "albums" || activeSection.indexOf("folder:") === 0
   property var albumKeys: ({})
   property bool albumLoading: false
   property string searchText: ""
@@ -174,6 +182,7 @@ ShellRoot {
     printErrors: false
     onLoaded: {
       var next = root.parseAppleId(text());
+      root.demoMode = /^\s*DEMO=1\s*$/m.test(text());
       root.skipTimer = /^\s*SKIP_TIMER=1\s*$/m.test(text());
       if (root.appleId && next !== root.appleId) { root.libraryItems = []; root.rebuild([], -1); root.startSync(); }
       root.appleId = next;
@@ -219,9 +228,101 @@ ShellRoot {
     watchChanges: true
     printErrors: false
     onLoaded: {
-      try { var rows = JSON.parse(text()); if (Array.isArray(rows)) root.albumRows = rows; } catch (e) {}
+      try { var rows = JSON.parse(text()); if (Array.isArray(rows)) { root.albumRows = rows; albumCoverTimer.restart(); } } catch (e) {}
     }
     onFileChanged: reload()
+  }
+  Process {
+    id: albumIndexProc
+    command: [root.catalogScript, "albums-refresh"]
+    onExited: (code, status) => {
+      albumIndexFile.reload();
+      if (code !== 0) toast.show("Could not load albums", 3500);
+    }
+  }
+  function refreshAlbums() {
+    if (needLogin || demoMode || albumIndexProc.running) return;
+    albumIndexProc.running = true;
+  }
+  Process {
+    id: albumCoverProc
+    onExited: albumIndexFile.reload()
+  }
+  Timer {
+    id: albumCoverTimer
+    interval: 400
+    onTriggered: {
+      if (!root.folderView || root.demoMode || root.needLogin || albumCoverProc.running) return;
+      var keys = root.folderChildren().filter(function (row) { return !row.isFolder && !row.cover && !root.coverAttempted[row.id]; })
+                   .slice(0, 8).map(function (row) { return row.id; });
+      if (!keys.length) return;
+      var tried = Object.assign({}, root.coverAttempted);
+      keys.forEach(function (key) { tried[key] = true; });
+      root.coverAttempted = tried;
+      albumCoverProc.command = [root.catalogScript, "album-covers"].concat(keys);
+      albumCoverProc.running = true;
+    }
+  }
+  Process {
+    id: albumActionProc
+    property string errorText: ""
+    property string actionName: ""
+    stderr: StdioCollector {
+      onStreamFinished: {
+        try { albumActionProc.errorText = JSON.parse(text.trim()).error || ""; }
+        catch (e) { albumActionProc.errorText = ""; }
+      }
+    }
+    onExited: (code, status) => {
+      if (code === 0) {
+        albumIndexFile.reload();
+        albumMembersFile.reload();
+        if (actionName === "album-delete") root.selectSection("albums");
+        if (root.activeSection.indexOf("album:") === 0) albumLoadTimer.restart();
+        toast.show("Album updated", 2500);
+      } else toast.show(albumActionProc.errorText || "Album change failed", 4000);
+    }
+  }
+  function runAlbumAction(command) {
+    if (demoMode) { toast.show("Album changes are unavailable in the synthetic demo", 3500); return; }
+    if (albumActionProc.running || needLogin) return;
+    albumActionProc.errorText = "";
+    albumActionProc.actionName = command[0];
+    albumActionProc.command = [catalogScript].concat(command);
+    albumActionProc.running = true;
+  }
+  function beginCollectionAction(action, target) {
+    albumAction = action;
+    albumActionTarget = target || "";
+    albumName.text = action === "rename" ? sectionTitle() : "";
+    albumNameDialog.open();
+  }
+  function askCollectionDelete(id, folder) {
+    pendingAlbumDeleteId = id;
+    pendingAlbumDeleteFolder = folder;
+    albumDeleteConfirm.open();
+  }
+  function currentAlbum() {
+    return activeSection.indexOf("album:") === 0 ? activeSection.slice(6) : "";
+  }
+  function currentAlbumEditable() {
+    var id = currentAlbum();
+    var row = albumRows.find(function (candidate) { return candidate.id === id; });
+    return !!row && row.editable === true;
+  }
+  function removeFromAlbum(list) {
+    var id = currentAlbum();
+    if (!id || !list.length) return;
+    runAlbumAction(["album-remove", id].concat(list.map(function (it) { return it.id; })));
+  }
+  function addToAlbum(list) {
+    if (!list.length) return;
+    if (list.some(function (it) { return it.zone !== "PrimarySync"; })) {
+      toast.show("This album supports personal-library photos only", 3500);
+      return;
+    }
+    albumActionItems = list;
+    albumPicker.open();
   }
   FileView {
     id: albumMembersFile
@@ -649,7 +750,25 @@ ShellRoot {
       var row = albumRows.find(function (a) { return a.id === id; });
       return row ? row.title : "Album";
     }
+    if (activeSection.indexOf("folder:") === 0) {
+      var folder = albumRows.find(function (a) { return a.id === activeSection.slice(7); });
+      return folder ? folder.title : "Folder";
+    }
+    if (activeSection === "albums") return "Albums";
     return names[activeSection] || "Library";
+  }
+
+  function folderChildren() {
+    if (!folderView) return [];
+    var parent = activeSection === "albums" ? null : activeSection.slice(7);
+    return albumRows.filter(function (row) { return (row.parent || null) === parent; });
+  }
+
+  function folderCover(row) {
+    if (row.cover) return row.cover;
+    if (!row.isFolder) return "";
+    var child = albumRows.find(function (candidate) { return candidate.parent === row.id && candidate.cover; });
+    return child ? child.cover : "";
   }
 
   function matchesSection(it) {
@@ -669,6 +788,9 @@ ShellRoot {
   function selectSection(section) {
     if (activeSection === section) return;
     activeSection = section;
+    albumCoverTimer.restart();
+    if ((section === "albums" || section.indexOf("folder:") === 0) && albumRows.length === 0)
+      refreshAlbums();
     if (section.indexOf("album:") === 0) {
       albumKeys = ({});
       albumLoading = true;
@@ -1358,6 +1480,7 @@ ShellRoot {
       CopyMenu {
         id: copyMenu
         theme: appTheme
+        inAlbum: root.currentAlbumEditable()
         onRequestCopy: items => root.copyCurrent(items)
         onRequestEvict: items => root.evictLocal(items)
         onRequestKeepOffline: items => root.keepOffline(items)
@@ -1366,7 +1489,114 @@ ShellRoot {
         onRequestOpen: root.openCurrent()
         onRequestSlideshow: items => root.startSlideshow(items)
         onRequestDelete: root.askDeleteItems(items)
+        onRequestAddToAlbum: items => root.addToAlbum(items)
+        onRequestRemoveFromAlbum: items => root.removeFromAlbum(items)
         onClosed: keys.forceActiveFocus()
+      }
+
+      Popup {
+        id: albumNameDialog
+        anchors.centerIn: parent
+        width: 340; height: 160
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        background: Rectangle { color: appTheme.darkBackground; radius: 9; border.color: appTheme.lighterBackground }
+        Column {
+          anchors.fill: parent; anchors.margins: 16; spacing: 12
+          Text {
+            text: root.albumAction === "rename" ? "Rename collection" :
+                  root.albumAction === "folder" ? "New Folder" : "New Album"
+            color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 17
+          }
+          TextField {
+            id: albumName
+            width: parent.width; height: 34
+            placeholderText: "Name"
+            color: appTheme.brightForeground
+            background: Rectangle { color: appTheme.background; radius: 5; border.color: appTheme.lighterBackground }
+            onAccepted: albumNameSave.clicked()
+          }
+          Row {
+            spacing: 10
+            Button { text: "Cancel"; onClicked: albumNameDialog.close() }
+            Button {
+              id: albumNameSave
+              text: root.albumAction === "rename" ? "Rename" : "Create"
+              enabled: albumName.text.trim().length > 0 && !albumActionProc.running
+              onClicked: {
+                var name = albumName.text.trim();
+                if (root.albumAction === "rename") root.runAlbumAction(["album-rename", root.albumActionTarget, name]);
+                else {
+                  var args = ["album-create", root.albumAction, name];
+                  if (root.albumActionTarget) args.push("--parent", root.albumActionTarget);
+                  root.runAlbumAction(args);
+                }
+                albumNameDialog.close();
+              }
+            }
+          }
+        }
+      }
+      Popup {
+        id: albumPicker
+        anchors.centerIn: parent
+        width: 340; height: Math.min(420, pickerColumn.implicitHeight + 30)
+        modal: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle { color: appTheme.darkBackground; radius: 9; border.color: appTheme.lighterBackground }
+        Flickable {
+          anchors.fill: parent; anchors.margins: 12
+          clip: true; contentHeight: pickerColumn.implicitHeight
+          Column {
+            id: pickerColumn
+            width: parent.width; spacing: 4
+            Text { text: "Add to Album"; height: 30; color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 17 }
+            Repeater {
+              model: root.albumRows.filter(function (row) { return !row.isFolder && row.editable === true && row.zone === "PrimarySync"; })
+              delegate: Rectangle {
+                required property var modelData
+                width: pickerColumn.width; height: 34; radius: 5
+                color: pickerArea.containsMouse ? appTheme.lighterBackground : "transparent"
+                Text {
+                  x: 8; anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - 16; elide: Text.ElideRight
+                  text: Array((modelData.depth || 0) + 1).join("   ") + modelData.title
+                  color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: appTheme.fontSize
+                }
+                MouseArea {
+                  id: pickerArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.runAlbumAction(["album-add", modelData.id].concat(root.albumActionItems.map(function (it) { return it.id; })));
+                    albumPicker.close();
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      Popup {
+        id: albumDeleteConfirm
+        anchors.centerIn: parent
+        width: 350; height: 130; modal: true
+        background: Rectangle { color: appTheme.darkBackground; radius: 9; border.color: appTheme.lighterBackground }
+        Column {
+          anchors.fill: parent; anchors.margins: 16; spacing: 12
+          Text { text: root.pendingAlbumDeleteFolder ? "Delete this empty folder from iCloud?" : "Delete this album from iCloud?"; color: appTheme.brightForeground; font.family: appTheme.fontFamily; font.pixelSize: 16 }
+          Text { text: root.pendingAlbumDeleteFolder ? "Only an empty folder can be deleted." : "Its photos stay in your library."; color: appTheme.darkForeground; font.family: appTheme.fontFamily; font.pixelSize: 12 }
+          Row {
+            spacing: 10
+            Button { text: "Cancel"; onClicked: albumDeleteConfirm.close() }
+            Button {
+              text: root.pendingAlbumDeleteFolder ? "Delete Folder" : "Delete Album"
+              onClicked: {
+                var id = root.pendingAlbumDeleteId;
+                albumDeleteConfirm.close();
+                if (id) root.runAlbumAction(["album-delete", id]);
+              }
+            }
+          }
+        }
       }
 
       Popup {
@@ -1731,6 +1961,7 @@ ShellRoot {
       // ---- Grid -----------------------------------------------------------
       Flickable {
         id: grid
+        visible: !root.folderView
         anchors.top: banner.bottom
         anchors.left: sidebar.right
         anchors.right: parent.right
@@ -2030,6 +2261,14 @@ ShellRoot {
               font.pixelSize: appTheme.fontSize
             }
           }
+          Row {
+            visible: root.currentAlbumEditable()
+            spacing: 8
+            Button { text: "Rename Album"; onClicked: root.beginCollectionAction("rename", root.currentAlbum()) }
+            Button { text: "Add Selected to Album…"; enabled: root.targets().length > 0; onClicked: root.addToAlbum(root.targets()) }
+            Button { text: "Remove Selected from Album"; enabled: root.targets().length > 0; onClicked: root.removeFromAlbum(root.targets()) }
+            Button { text: "Delete Album…"; onClicked: root.askCollectionDelete(root.currentAlbum(), false) }
+          }
 
           Repeater {
             id: daysRepeater
@@ -2099,13 +2338,106 @@ ShellRoot {
 
       }
 
+      Flickable {
+        id: folderPane
+        visible: root.folderView && !root.needLogin
+        anchors.top: banner.bottom
+        anchors.left: sidebar.right
+        anchors.right: parent.right
+        anchors.bottom: footer.top
+        clip: true
+        contentWidth: width
+        contentHeight: folderColumn.implicitHeight + 32
+        boundsBehavior: Flickable.StopAtBounds
+        Column {
+          id: folderColumn
+          x: 20; y: 18; width: folderPane.width - 40; spacing: 14
+          Text {
+            text: root.sectionTitle()
+            color: appTheme.brightForeground
+            font.family: appTheme.fontFamily
+            font.pixelSize: 19
+            font.bold: true
+          }
+          Text {
+            text: root.folderChildren().length + " albums and folders"
+            color: appTheme.darkForeground
+            font.family: appTheme.fontFamily
+            font.pixelSize: appTheme.fontSize
+          }
+          Row {
+            spacing: 8
+            Button {
+              text: "New Folder"
+              onClicked: root.beginCollectionAction("folder", root.activeSection.indexOf("folder:") === 0 ? root.activeSection.slice(7) : "")
+            }
+            Button {
+              text: "New Album"
+              onClicked: root.beginCollectionAction("album", root.activeSection.indexOf("folder:") === 0 ? root.activeSection.slice(7) : "")
+            }
+            Button {
+              visible: root.activeSection.indexOf("folder:") === 0
+              text: "Rename Folder"
+              onClicked: root.beginCollectionAction("rename", root.activeSection.slice(7))
+            }
+            Button {
+              visible: root.activeSection.indexOf("folder:") === 0
+              text: "Delete Empty Folder…"
+              onClicked: root.askCollectionDelete(root.activeSection.slice(7), true)
+            }
+          }
+          Flow {
+            width: parent.width; spacing: 18
+            Repeater {
+              model: root.folderChildren()
+              delegate: Item {
+                required property var modelData
+                width: 185; height: 225
+                Rectangle {
+                  width: 185; height: 185; radius: 5
+                  color: appTheme.lighterBackground
+                  clip: true
+                  Image {
+                    anchors.fill: parent
+                    source: root.folderCover(modelData) ? "file://" + root.folderCover(modelData) : ""
+                    fillMode: Image.PreserveAspectCrop
+                    asynchronous: true
+                    visible: status === Image.Ready
+                  }
+                  Text {
+                    anchors.centerIn: parent
+                    visible: !root.folderCover(modelData)
+                    text: modelData.isFolder ? "\uf07b" : "\uf03e"
+                    color: appTheme.accent
+                    font.family: appTheme.fontFamily
+                    font.pixelSize: 54
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.selectSection((modelData.isFolder ? "folder:" : "album:") + modelData.id)
+                  }
+                }
+                Text {
+                  y: 189; width: 185; elide: Text.ElideRight
+                  text: modelData.title
+                  color: appTheme.brightForeground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                }
+              }
+            }
+          }
+        }
+      }
+
       // Empty / first-run state. A sibling of the grid rather than a child:
       // children of a Flickable live in its content item, which is only as
       // tall as the content, so "centered" would sit at the top.
       Column {
         anchors.centerIn: grid
         spacing: 10
-        visible: root.items.length === 0 && !root.needLogin
+        visible: root.items.length === 0 && !root.needLogin && !root.folderView
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
           text: root.albumLoading && root.activeSection.indexOf("album:") === 0 ? "Loading album…" : root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No items in " + root.sectionTitle())

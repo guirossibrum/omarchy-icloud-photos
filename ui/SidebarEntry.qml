@@ -7,7 +7,10 @@ Rectangle {
   property string icon: ""
   property bool selected: false
   property int indent: 0
+  property bool expandable: false
+  property bool expanded: false
   signal activated()
+  signal expansionRequested()
 
   width: parent ? parent.width - 16 : 208
   x: 8
@@ -18,6 +21,14 @@ Rectangle {
 
   Text {
     x: 16 + root.indent
+    visible: root.expandable
+    anchors.verticalCenter: parent.verticalCenter
+    text: root.expanded ? "⌄" : "›"
+    color: root.theme.darkForeground
+    font.pixelSize: 15
+  }
+  Text {
+    x: 16 + root.indent + (root.expandable ? 17 : 0)
     anchors.verticalCenter: parent.verticalCenter
     width: 23
     text: root.icon
@@ -26,7 +37,7 @@ Rectangle {
     font.pixelSize: 16
   }
   Text {
-    x: 47 + root.indent
+    x: 47 + root.indent + (root.expandable ? 17 : 0)
     anchors.verticalCenter: parent.verticalCenter
     width: root.width - x - 10
     elide: Text.ElideRight
@@ -41,5 +52,14 @@ Rectangle {
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
     onClicked: root.activated()
+  }
+  MouseArea {
+    visible: root.expandable
+    x: 8 + root.indent
+    y: 0
+    width: 25
+    height: parent.height
+    cursorShape: Qt.PointingHandCursor
+    onClicked: root.expansionRequested()
   }
 }

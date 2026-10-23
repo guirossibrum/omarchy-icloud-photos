@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local, account-scoped iCloud catalog. No cloud mutation is performed here.
+"""Local, account-scoped iCloud catalog and explicit collection actions.
 
 The only files eligible for eviction live under cache/originals and are recorded
 as owned. Legacy icloudpd downloads are indexed in place but never removed.
@@ -19,6 +19,8 @@ import sys
 import time
 import signal
 import subprocess
+from urllib.parse import urlencode
+from uuid import uuid4
 
 from pyicloud_ipd.base import PyiCloudService
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
@@ -122,6 +124,8 @@ class Catalog:
             CREATE TABLE IF NOT EXISTS albums (
               id TEXT PRIMARY KEY, account TEXT NOT NULL, zone TEXT NOT NULL,
               record TEXT NOT NULL, title TEXT NOT NULL, seen INTEGER NOT NULL,
+              parent TEXT, is_folder INTEGER NOT NULL DEFAULT 0, album_type INTEGER, position REAL,
+              cover TEXT, cover_checked_at REAL,
               UNIQUE(account, zone, record));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(assets)")}
@@ -138,6 +142,13 @@ class Catalog:
             # Every pre-policy app-owned original came from an explicit
             # download. Preserve it when the new policy is first enabled.
             self.db.execute("UPDATE assets SET keep_offline=1 WHERE owned=1")
+        album_columns = {row[1] for row in self.db.execute("PRAGMA table_info(albums)")}
+        for name, kind in (("parent", "TEXT"), ("is_folder", "INTEGER NOT NULL DEFAULT 0"),
+                           ("album_type", "INTEGER"),
+                           ("position", "REAL"), ("cover", "TEXT"),
+                           ("cover_checked_at", "REAL")):
+            if name not in album_columns:
+                self.db.execute(f"ALTER TABLE albums ADD COLUMN {name} {kind}")
         self.db.commit()
 
     def upsert(self, data, seen):
@@ -259,43 +270,132 @@ def expire_previews(cat):
     cat.export()
 
 
-def refresh_albums(cat, cfg, api, force=False):
-    """List real user albums by stable folder ID; this costs one query per zone."""
+def album_records(library, parent=None):
+    """Page album metadata; a filtered query exposes children of one folder."""
+    query = {"query": {"recordType": "CPLAlbumByPositionLive"},
+             "zoneID": library.zone_id,
+             "desiredKeys": ["albumNameEnc", "albumType", "position", "isDeleted"]}
+    if parent is not None:
+        query["query"]["filterBy"] = [{"fieldName": "parentId", "comparator": "EQUALS",
+                                         "fieldValue": {"type": "STRING", "value": parent}}]
+    url = f"{library.service_endpoint}/records/query?{urlencode(library.params)}"
+    markers = set()
+    while True:
+        response = library.session.post(url, data=json.dumps(query), headers={"Content-type": "text/plain"})
+        response.raise_for_status()
+        body = response.json()
+        if body.get("errors") or any(row.get("serverErrorCode") for row in body.get("records", [])):
+            raise ValueError("iCloud rejected the album query")
+        yield from body.get("records", [])
+        marker = body.get("continuationMarker")
+        if not marker:
+            break
+        if marker in markers:
+            raise ValueError("repeated album pagination marker")
+        markers.add(marker)
+        query["continuationMarker"] = marker
+
+
+def album_tree(cat):
+    rows = [dict(row) for row in cat.db.execute("SELECT * FROM albums WHERE account=?", (cat.account,))]
+    by_id = {row["id"]: row for row in rows}
+    children = {}
+    for row in rows:
+        parent = row["parent"] if row["parent"] in by_id and row["parent"] != row["id"] else None
+        children.setdefault(parent, []).append(row)
+    def ordered(rows):
+        return sorted(rows, key=lambda row: (row["position"] is None,
+                                              row["position"] if row["position"] is not None else 0,
+                                              row["title"].casefold(), row["id"]))
+    out, visited = [], set()
+    def walk(row, depth, parent=None):
+        if row["id"] in visited:
+            return
+        visited.add(row["id"])
+        out.append(dict(id=row["id"], title=row["title"], zone=row["zone"],
+                        parent=parent, isFolder=bool(row["is_folder"]), depth=depth,
+                        editable=row["album_type"] in (0, 3),
+                        cover=row["cover"] if row["cover"] and Path(row["cover"]).is_file() else ""))
+        for child in ordered(children.get(row["id"], [])):
+            walk(child, depth + 1, row["id"])
+    for row in ordered(children.get(None, [])):
+        walk(row, 0)
+    for row in ordered(rows):
+        walk(row, 0)  # Broken parent links remain visible at the root.
+    return out
+
+
+def refresh_albums(cat, cfg, api, force=False, strict=False):
+    """Refresh the read-only album/folder tree without downloading media."""
     index = cat.cache / "album-index.json"
     if not force and index.is_file() and time.time() - index.stat().st_mtime < 6 * 3600:
-        return
+        try:
+            cached = json.loads(index.read_text())
+            if not cached or "isFolder" in cached[0]:
+                return
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     seen = time.time_ns()
     try:
+        zones_seen = []
         for zone, library in libraries(api, cfg.get("SHARED_LIBRARY", "auto")):
             if getattr(library, "library_type", "shared") != "private":
                 continue  # Installed pyicloud exposes no folders for shared DB zones.
-            for folder in library._fetch_folders():
-                raw = folder["recordName"]
-                if raw in ("----Root-Folder----", "----Project-Root-Folder----"):
+            zones_seen.append(zone)
+            records = {}
+            parents = {}
+            folders_to_visit = []
+            for record in album_records(library):
+                raw = record.get("recordName")
+                if raw and raw not in ("----Root-Folder----", "----Project-Root-Folder----"):
+                    records[raw] = record
+                    if field(record, "albumType") == 3:
+                        folders_to_visit.append(raw)
+            visited_folders = set()
+            while folders_to_visit:
+                folder_id = folders_to_visit.pop()
+                if folder_id in visited_folders:
                     continue
-                if field(folder, "isDeleted"):
+                visited_folders.add(folder_id)
+                for child in album_records(library, folder_id):
+                    raw = child.get("recordName")
+                    if not raw or raw == folder_id:
+                        continue
+                    records[raw] = child
+                    parents[raw] = folder_id
+                    if field(child, "albumType") == 3:
+                        folders_to_visit.append(raw)
+            for raw, record in records.items():
+                if field(record, "isDeleted") or not field(record, "albumNameEnc"):
                     continue
-                encoded = field(folder, "albumNameEnc")
-                if not encoded:
-                    continue
-                title = base64.b64decode(encoded).decode("utf-8")
+                title = base64.b64decode(field(record, "albumNameEnc")).decode("utf-8")
                 key = item_key(cat.account, zone, "album:" + raw)
-                cat.db.execute("""INSERT INTO albums(id,account,zone,record,title,seen)
-                    VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,seen=excluded.seen""",
-                    (key, cat.account, zone, raw, title, seen))
-        cat.db.execute("DELETE FROM albums WHERE account=? AND seen!=?", (cat.account, seen))
+                parent = item_key(cat.account, zone, "album:" + parents[raw]) if raw in parents else None
+                cat.db.execute("""INSERT INTO albums(id,account,zone,record,title,seen,parent,is_folder,album_type,position)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,seen=excluded.seen,parent=excluded.parent,
+                    is_folder=excluded.is_folder,album_type=excluded.album_type,position=excluded.position""",
+                    (key, cat.account, zone, raw, title, seen, parent,
+                     int(field(record, "albumType") == 3), field(record, "albumType"),
+                     field(record, "position")))
+        for zone in zones_seen:
+            cat.db.execute("DELETE FROM albums WHERE account=? AND zone=? AND seen!=?",
+                           (cat.account, zone, seen))
         cat.db.commit()
     except Exception:
         cat.db.rollback()
+        if strict:
+            raise
         return  # Album availability must not fail the main library sync.
-    atomic_json(index, [dict(id=row["id"], title=row["title"], zone=row["zone"])
-                        for row in cat.db.execute("SELECT * FROM albums WHERE account=? ORDER BY title,id", (cat.account,))])
+    atomic_json(index, album_tree(cat))
 
 
 def load_album_members(cat, cfg, key, api=None, max_items=None):
     row = cat.db.execute("SELECT * FROM albums WHERE account=? AND id=?", (cat.account, key)).fetchone()
     if row is None:
         raise ValueError("album is absent from this account's catalog")
+    if row["is_folder"]:
+        raise ValueError("folders contain albums, not photos")
     path = cat.cache / "albums" / (key + ".json")
     if path.is_file() and time.time() - path.stat().st_mtime < 1800:
         try:
@@ -316,11 +416,167 @@ def load_album_members(cat, cfg, key, api=None, max_items=None):
     ids = []
     source = islice(album, max_items) if max_items else album
     for asset in source:
-        ids.append(item_key(cat.account, row["zone"], asset.id))
+        asset_key = item_key(cat.account, row["zone"], asset.id)
+        ids.append(asset_key)
+        if not row["cover"]:
+            known = cat.db.execute("SELECT thumb FROM assets WHERE id=? AND account=?",
+                                   (asset_key, cat.account)).fetchone()
+            if known and known["thumb"] and Path(known["thumb"]).is_file():
+                cat.db.execute("UPDATE albums SET cover=? WHERE id=?", (known["thumb"], key))
+                cat.db.commit()
+                row = cat.db.execute("SELECT * FROM albums WHERE id=?", (key,)).fetchone()
         if len(ids) % 100 == 0:
             atomic_json(path, dict(albumId=key, ids=ids, complete=False))
     atomic_json(path, dict(albumId=key, ids=ids, complete=True,
                            limited=max_items is not None, limit=max_items))
+    atomic_json(cat.cache / "album-index.json", album_tree(cat))
+
+
+def refresh_album_covers(cat, cfg, keys, api=None):
+    """Fetch one JPEG thumbnail per requested album, never full media."""
+    api = api or cloud(cfg)
+    by_zone = dict(libraries(api, cfg.get("SHARED_LIBRARY", "auto")))
+    changed = False
+    for key in keys[:12]:
+        row = cat.db.execute("SELECT * FROM albums WHERE id=? AND account=?", (key, cat.account)).fetchone()
+        if not row or row["is_folder"] or row["cover"] and Path(row["cover"]).is_file():
+            continue
+        if row["cover_checked_at"] and time.time() - row["cover_checked_at"] < 86400:
+            continue
+        library = by_zone.get(row["zone"])
+        if library is None:
+            continue
+        album = PhotoAlbum(library.params, library.session, library.service_endpoint,
+            row["title"], "CPLContainerRelationLiveByAssetDate",
+            f"CPLContainerRelationNotDeletedByAssetDate:{row['record']}",
+            [{"fieldName": "parentId", "comparator": "EQUALS",
+              "fieldValue": {"type": "STRING", "value": row["record"]}}], zone_id=library.zone_id)
+        cover = None
+        for asset in islice(album, 3):
+            asset_key = item_key(cat.account, row["zone"], asset.id)
+            if cache_thumbnail(cat, library, asset, asset_key):
+                cover = str(cat.cache / "thumbs" / (asset_key + ".jpg"))
+                break
+        with cat.db:
+            cat.db.execute("UPDATE albums SET cover=?,cover_checked_at=? WHERE id=?",
+                           (cover, time.time(), key))
+        changed = True
+    if changed:
+        atomic_json(cat.cache / "album-index.json", album_tree(cat))
+
+
+def album_row(cat, key, folder=None):
+    row = cat.db.execute("SELECT * FROM albums WHERE id=? AND account=?", (key, cat.account)).fetchone()
+    if row is None or folder is not None and bool(row["is_folder"]) != folder:
+        raise ValueError("collection is absent from this account's catalog")
+    if row["album_type"] not in (None, 0, 3):
+        raise ValueError("smart and shared albums cannot be edited here")
+    return row
+
+
+def album_library(api, cfg, zone):
+    library = dict(libraries(api, cfg.get("SHARED_LIBRARY", "auto"))).get(zone)
+    if library is None or getattr(library, "library_type", "shared") != "private":
+        raise ValueError("album editing is available only in a personal library")
+    return library
+
+
+def modify_records(library, operations):
+    """Send only the specified collection operations and inspect every result."""
+    url = f"{library.service_endpoint}/records/modify?{urlencode(library.params)}"
+    body = {"atomic": True, "zoneID": library.zone_id, "operations": operations}
+    response = library.session.post(url, data=json.dumps(body),
+                                    headers={"Content-type": "application/json"})
+    response.raise_for_status()
+    records = response.json().get("records", [])
+    if len(records) != len(operations) or any(record.get("serverErrorCode") for record in records):
+        raise RuntimeError("iCloud did not confirm the album change")
+    return records
+
+
+def album_record(library, raw):
+    for record in album_records(library):
+        if record.get("recordName") == raw:
+            return record
+    raise ValueError("album no longer exists in iCloud")
+
+
+def collection_action(cat, cfg, action, api=None, key=None, title=None,
+                      parent=None, zone="PrimarySync", ids=()):
+    """Mutate an album, never an asset's deletion flag or local media files."""
+    api = api or cloud(cfg)
+    if action == "create":
+        if not title or not title.strip() or len(title) > 255:
+            raise ValueError("collection name must contain 1 to 255 characters")
+        if parent:
+            parent_row = album_row(cat, parent, folder=True)
+            zone = parent_row["zone"]
+        library = album_library(api, cfg, zone)
+        raw = uuid4().hex.upper()
+        fields = {
+            "albumNameEnc": {"type": "ENCRYPTED_BYTES", "value": base64.b64encode(title.strip().encode()).decode()},
+            "albumType": {"type": "INT64", "value": 3 if key == "folder" else 0},
+            "isDeleted": {"type": "INT64", "value": 0},
+            "isExpunged": {"type": "INT64", "value": 0},
+            "position": {"type": "INT64", "value": int(time.time() * 1000)},
+            "sortType": {"type": "INT64", "value": 1},
+            "sortAscending": {"type": "INT64", "value": 1},
+        }
+        if parent:
+            fields["parentId"] = {"type": "STRING", "value": parent_row["record"]}
+        record = {"recordName": raw, "recordType": "CPLAlbum", "fields": fields,
+                  "pluginFields": {}}
+        modify_records(library, [{"operationType": "create", "record": record}])
+        result = item_key(cat.account, zone, "album:" + raw)
+    elif action in ("rename", "delete"):
+        row = album_row(cat, key)
+        library = album_library(api, cfg, row["zone"])
+        fresh = album_record(library, row["record"])
+        if action == "rename":
+            if not title or not title.strip() or len(title) > 255:
+                raise ValueError("collection name must contain 1 to 255 characters")
+            fields = {"albumNameEnc": {"type": "ENCRYPTED_BYTES",
+                       "value": base64.b64encode(title.strip().encode()).decode()}}
+        else:
+            if row["is_folder"]:
+                if any(not field(child, "isDeleted") for child in album_records(library, row["record"])):
+                    raise ValueError("move or remove the folder's contents before deleting it")
+            fields = {"isDeleted": {"type": "INT64", "value": 1}}
+        record = {"recordName": row["record"], "recordType": "CPLAlbum",
+                  "recordChangeTag": fresh["recordChangeTag"], "fields": fields,
+                  "pluginFields": {}}
+        modify_records(library, [{"operationType": "update", "record": record}])
+        result = key
+    elif action in ("add", "remove"):
+        row = album_row(cat, key, folder=False)
+        library = album_library(api, cfg, row["zone"])
+        if not ids or len(ids) > 100:
+            raise ValueError("select 1 to 100 photos")
+        operations = []
+        for asset_key in ids:
+            asset_row = cat.get(asset_key)
+            if asset_row["zone"] != row["zone"]:
+                raise ValueError("photo and album belong to different libraries")
+            asset = catalog_asset(library, asset_row)
+            asset_raw = asset._asset_record["recordName"]
+            relation = asset_raw + "-IN-" + row["record"]
+            if action == "add":
+                record = {"recordName": relation, "recordType": "CPLContainerRelation",
+                          "fields": {"containerId": {"type": "STRING", "value": row["record"]},
+                                     "itemId": {"type": "STRING", "value": asset_raw},
+                                     "position": {"type": "INT64", "value": int(time.time() * 1000)}},
+                          "pluginFields": {}}
+                operations.append({"operationType": "create", "record": record})
+            else:
+                operations.append({"operationType": "delete", "record": {
+                    "recordName": relation, "recordType": "CPLContainerRelation"}})
+        modify_records(library, operations)
+        result = key
+        (cat.cache / "albums" / (key + ".json")).unlink(missing_ok=True)
+    else:
+        raise ValueError("unknown album action")
+    refresh_albums(cat, cfg, api, force=True, strict=True)
+    return result
 
 
 def status(cache, state, message="", count=0):
@@ -892,6 +1148,16 @@ def main():
     look = sub.add_parser("preview"); look.add_argument("id")
     album = sub.add_parser("album-members"); album.add_argument("id")
     album.add_argument("--max-items", type=int)
+    sub.add_parser("albums-refresh")
+    covers = sub.add_parser("album-covers"); covers.add_argument("ids", nargs="+")
+    create_album = sub.add_parser("album-create")
+    create_album.add_argument("kind", choices=("album", "folder"))
+    create_album.add_argument("title")
+    create_album.add_argument("--parent")
+    rename_album = sub.add_parser("album-rename"); rename_album.add_argument("id"); rename_album.add_argument("title")
+    delete_album = sub.add_parser("album-delete"); delete_album.add_argument("id")
+    add_album = sub.add_parser("album-add"); add_album.add_argument("id"); add_album.add_argument("ids", nargs="+")
+    remove_album = sub.add_parser("album-remove"); remove_album.add_argument("id"); remove_album.add_argument("ids", nargs="+")
     policy = sub.add_parser("policy"); policy.add_argument("--limit", type=int, default=12)
     remove = sub.add_parser("evict"); remove.add_argument("ids", nargs="+")
     convert = sub.add_parser("convert"); convert.add_argument("ids", nargs="+")
@@ -946,6 +1212,19 @@ def main():
             if cap is None and os.environ.get("OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS"):
                 cap = int(os.environ["OMARCHY_ICLOUD_PHOTOS_MAX_SYNC_ITEMS"])
             load_album_members(cat, cfg, args.id, max_items=cap)
+        elif args.command == "albums-refresh":
+            refresh_albums(cat, cfg, cloud(cfg), force=True, strict=True)
+        elif args.command == "album-covers":
+            refresh_album_covers(cat, cfg, args.ids)
+        elif args.command == "album-create":
+            print(json.dumps({"id": collection_action(cat, cfg, "create", key=args.kind,
+                title=args.title, parent=args.parent)}), flush=True)
+        elif args.command == "album-rename":
+            collection_action(cat, cfg, "rename", key=args.id, title=args.title)
+        elif args.command == "album-delete":
+            collection_action(cat, cfg, "delete", key=args.id)
+        elif args.command in ("album-add", "album-remove"):
+            collection_action(cat, cfg, args.command[6:], key=args.id, ids=args.ids)
         elif args.command == "policy":
             if args.limit < 1 or args.limit > 50:
                 parser.error("--limit must be between 1 and 50")

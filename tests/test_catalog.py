@@ -623,10 +623,13 @@ class CatalogTests(unittest.TestCase):
         self.personal.service_endpoint = "https://fabricated.invalid"
         self.personal.zone_id = {"zoneName": "PrimarySync"}
         title = base64.b64encode(b"Fabricated Album").decode()
-        self.personal._fetch_folders = lambda: [
-            {"recordName": folder, "fields": {"albumNameEnc": {"value": title}}}
-            for folder in ("folder-one", "folder-two")]
-        catalog.refresh_albums(self.cat, self.cfg, self.api, force=True)
+        def records(_library, parent=None):
+            self.assertIsNone(parent)
+            return [{"recordName": folder, "fields": {"albumNameEnc": {"value": title},
+                                                      "albumType": {"value": 0}}}
+                    for folder in ("folder-one", "folder-two")]
+        with patch.object(catalog, "album_records", side_effect=records):
+            catalog.refresh_albums(self.cat, self.cfg, self.api, force=True)
         rows = json.loads((self.cache / "album-index.json").read_text())
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["title"], rows[1]["title"])
@@ -638,6 +641,117 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(members["ids"]), 230)
         self.assertEqual(members["ids"][0], catalog.item_key(self.cat.account, "PrimarySync", "p0"))
         self.assertTrue(all(not x["downloaded"] for x in json.loads((self.cache / "index.json").read_text())))
+
+    def test_album_folder_tree_preserves_parent_and_duplicate_names(self):
+        self.personal.library_type = "private"
+        self.personal.zone_id = {"zoneName": "PrimarySync"}
+        self.personal.params = {}
+        self.personal.service_endpoint = "https://fabricated.invalid"
+        def record(name, kind, title):
+            return {"recordName": name, "fields": {
+                "albumNameEnc": {"value": base64.b64encode(title.encode()).decode()},
+                "albumType": {"value": kind}}}
+        pages = {
+            None: [record("folder-a", 3, "Trips"), record("album-root", 0, "Photos")],
+            "folder-a": [record("folder-b", 3, "Trips"), record("album-a", 0, "Photos")],
+            "folder-b": [record("album-b", 0, "Photos")],
+        }
+        with patch.object(catalog, "album_records", side_effect=lambda lib, parent=None: pages[parent]):
+            catalog.refresh_albums(self.cat, self.cfg, self.api, force=True)
+        rows = json.loads((self.cache / "album-index.json").read_text())
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([row["depth"] for row in rows], [0, 0, 1, 1, 2])
+        self.assertEqual(rows[4]["parent"], rows[3]["id"])
+        self.assertEqual(len({row["id"] for row in rows}), 5)
+
+    def test_album_mutations_use_collection_records_only(self):
+        catalog.sync(self.cat, self.cfg, self.api, max_items=1)
+        self.personal.library_type = "private"
+        self.personal.zone_id = {"zoneName": "PrimarySync"}
+        self.personal.params = {}
+        self.personal.service_endpoint = "https://fabricated.invalid"
+        parent = catalog.item_key(self.cat.account, "PrimarySync", "album:folder")
+        album = catalog.item_key(self.cat.account, "PrimarySync", "album:album")
+        with self.cat.db:
+            self.cat.db.execute("INSERT INTO albums(id,account,zone,record,title,seen,is_folder) VALUES(?,?,?,?,?,?,1)",
+                                (parent, self.cat.account, "PrimarySync", "folder", "Trips", 1))
+            self.cat.db.execute("INSERT INTO albums(id,account,zone,record,title,seen,is_folder) VALUES(?,?,?,?,?,?,0)",
+                                (album, self.cat.account, "PrimarySync", "album", "Pictures", 1))
+        sent = []
+        class Reply:
+            def raise_for_status(self): pass
+            def json(self): return {"records": [{"recordName": "ok"} for _ in sent[-1]["operations"]]}
+        def post(_url, data, headers):
+            sent.append(json.loads(data))
+            return Reply()
+        self.personal.session.post = post
+        asset_key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        with patch.object(catalog, "refresh_albums"):
+            catalog.collection_action(self.cat, self.cfg, "create", self.api,
+                                      key="folder", title="Nested", parent=parent)
+            catalog.collection_action(self.cat, self.cfg, "add", self.api,
+                                      key=album, ids=[asset_key])
+            catalog.collection_action(self.cat, self.cfg, "remove", self.api,
+                                      key=album, ids=[asset_key])
+        self.assertEqual(sent[0]["operations"][0]["record"]["fields"]["parentId"]["value"], "folder")
+        self.assertEqual(sent[1]["operations"][0]["record"]["recordType"], "CPLContainerRelation")
+        self.assertEqual(sent[2]["operations"][0]["operationType"], "delete")
+        self.assertEqual(sent[2]["operations"][0]["record"]["recordType"], "CPLContainerRelation")
+        self.assertEqual(self.cat.get(asset_key)["state"], "cloud-only")
+
+    def test_album_metadata_query_pages_and_filters_children(self):
+        self.personal.zone_id = {"zoneName": "PrimarySync"}
+        self.personal.params = {}
+        self.personal.service_endpoint = "https://fabricated.invalid"
+        requests = []
+        class Reply:
+            def __init__(self, body): self.body = body
+            def raise_for_status(self): pass
+            def json(self): return self.body
+        def post(_url, data, headers):
+            query = json.loads(data)
+            requests.append(query)
+            if "continuationMarker" not in query:
+                return Reply({"records": [{"recordName": "first"}], "continuationMarker": "next"})
+            return Reply({"records": [{"recordName": "second"}]})
+        self.personal.session.post = post
+        records = list(catalog.album_records(self.personal, "fabricated-folder"))
+        self.assertEqual([r["recordName"] for r in records], ["first", "second"])
+        self.assertEqual(requests[0]["query"]["filterBy"][0]["fieldValue"]["value"], "fabricated-folder")
+        self.assertEqual(requests[1]["continuationMarker"], "next")
+
+    def test_album_mutation_rejection_does_not_change_catalog(self):
+        self.personal.library_type = "private"
+        self.personal.zone_id = {"zoneName": "PrimarySync"}
+        self.personal.params = {}
+        self.personal.service_endpoint = "https://fabricated.invalid"
+        class Reply:
+            def raise_for_status(self): pass
+            def json(self): return {"records": [{"serverErrorCode": "PERMISSION_DENIED"}]}
+        self.personal.session.post = lambda *_args, **_kwargs: Reply()
+        with self.assertRaises(RuntimeError), patch.object(catalog, "refresh_albums") as refresh:
+            catalog.collection_action(self.cat, self.cfg, "create", self.api,
+                                      key="album", title="Fabricated")
+        refresh.assert_not_called()
+        self.assertEqual(self.cat.db.execute("SELECT COUNT(*) FROM albums").fetchone()[0], 0)
+
+    def test_nonempty_folder_cannot_be_deleted(self):
+        self.personal.library_type = "private"
+        self.personal.zone_id = {"zoneName": "PrimarySync"}
+        self.personal.params = {}
+        self.personal.service_endpoint = "https://fabricated.invalid"
+        key = catalog.item_key(self.cat.account, "PrimarySync", "album:folder")
+        with self.cat.db:
+            self.cat.db.execute("INSERT INTO albums(id,account,zone,record,title,seen,is_folder,album_type) VALUES(?,?,?,?,?,?,1,3)",
+                                (key, self.cat.account, "PrimarySync", "folder", "Trips", 1))
+        def records(_library, parent=None):
+            return [{"recordName": "child", "fields": {"isDeleted": {"value": 0}}}] if parent else [
+                {"recordName": "folder", "recordChangeTag": "tag"}]
+        with patch.object(catalog, "album_records", side_effect=records), \
+             patch.object(catalog, "modify_records") as modify:
+            with self.assertRaisesRegex(ValueError, "contents"):
+                catalog.collection_action(self.cat, self.cfg, "delete", self.api, key=key)
+            modify.assert_not_called()
 
 
 if __name__ == "__main__":
