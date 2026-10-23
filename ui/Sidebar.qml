@@ -29,6 +29,24 @@ Rectangle {
     next[id] = next[id] !== true;
     expandedFolders = next;
   }
+  function revealSelection(section) {
+    var split = section.indexOf(":");
+    if (split < 0) return;
+    var id = section.slice(split + 1);
+    var next = Object.assign({}, expandedFolders);
+    var row = albumRows.find(function (entry) { return entry.id === id; });
+    if (!row) return;
+    if (row.isFolder) next[row.id] = true;
+    var parent = row.parent, hops = 0;
+    while (parent && hops++ < albumRows.length) {
+      next[parent] = true;
+      var ancestor = albumRows.find(function (entry) { return entry.id === parent; });
+      parent = ancestor ? ancestor.parent : null;
+    }
+    expandedFolders = next;
+  }
+  onSectionChanged: revealSelection(section)
+  onAlbumRowsChanged: revealSelection(section)
 
   color: theme.darkBackground
   readonly property var photoRows: [
@@ -132,12 +150,17 @@ Rectangle {
           theme: root.theme
           label: modelData.title
           icon: modelData.isFolder ? "\uf07b" : "\uf03e"
+          thumbnail: modelData.isFolder ? "" : (modelData.cover || "")
           indent: 16 + Math.min(modelData.depth || 0, 7) * 13
           expandable: modelData.isFolder
           expanded: root.expandedFolders[modelData.id] === true
           selected: root.section === (modelData.isFolder ? "folder:" : "album:") + modelData.id
           onExpansionRequested: root.toggleFolder(modelData.id)
-          onActivated: root.sectionSelected((modelData.isFolder ? "folder:" : "album:") + modelData.id)
+          onActivated: {
+            var section = (modelData.isFolder ? "folder:" : "album:") + modelData.id;
+            root.revealSelection(section);
+            root.sectionSelected(section);
+          }
         }
       }
       Rectangle {

@@ -652,7 +652,8 @@ class CatalogTests(unittest.TestCase):
                 "albumNameEnc": {"value": base64.b64encode(title.encode()).decode()},
                 "albumType": {"value": kind}}}
         pages = {
-            None: [record("folder-a", 3, "Trips"), record("album-root", 0, "Photos")],
+            None: [record("folder-a", 3, "Trips"), record("album-root", 0, "Photos"),
+                   record("system-collection", 7, "System")],
             "folder-a": [record("folder-b", 3, "Trips"), record("album-a", 0, "Photos")],
             "folder-b": [record("album-b", 0, "Photos")],
         }
@@ -660,6 +661,7 @@ class CatalogTests(unittest.TestCase):
             catalog.refresh_albums(self.cat, self.cfg, self.api, force=True)
         rows = json.loads((self.cache / "album-index.json").read_text())
         self.assertEqual(len(rows), 5)
+        self.assertTrue(all(row["albumType"] in (0, 3) for row in rows))
         self.assertEqual([row["depth"] for row in rows], [0, 0, 1, 1, 2])
         self.assertEqual(rows[4]["parent"], rows[3]["id"])
         self.assertEqual(len({row["id"] for row in rows}), 5)

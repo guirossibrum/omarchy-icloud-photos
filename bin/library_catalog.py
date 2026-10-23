@@ -297,7 +297,8 @@ def album_records(library, parent=None):
 
 
 def album_tree(cat):
-    rows = [dict(row) for row in cat.db.execute("SELECT * FROM albums WHERE account=?", (cat.account,))]
+    rows = [dict(row) for row in cat.db.execute(
+        "SELECT * FROM albums WHERE account=? AND album_type IN (0,3)", (cat.account,))]
     by_id = {row["id"]: row for row in rows}
     children = {}
     for row in rows:
@@ -314,6 +315,7 @@ def album_tree(cat):
         visited.add(row["id"])
         out.append(dict(id=row["id"], title=row["title"], zone=row["zone"],
                         parent=parent, isFolder=bool(row["is_folder"]), depth=depth,
+                        albumType=row["album_type"],
                         editable=row["album_type"] in (0, 3),
                         cover=row["cover"] if row["cover"] and Path(row["cover"]).is_file() else ""))
         for child in ordered(children.get(row["id"], [])):
@@ -366,7 +368,8 @@ def refresh_albums(cat, cfg, api, force=False, strict=False):
                     if field(child, "albumType") == 3:
                         folders_to_visit.append(raw)
             for raw, record in records.items():
-                if field(record, "isDeleted") or not field(record, "albumNameEnc"):
+                if field(record, "isDeleted") or not field(record, "albumNameEnc") or \
+                        field(record, "albumType") not in (0, 3):
                     continue
                 title = base64.b64decode(field(record, "albumNameEnc")).decode("utf-8")
                 key = item_key(cat.account, zone, "album:" + raw)

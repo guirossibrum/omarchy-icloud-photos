@@ -34,6 +34,7 @@ ShellRoot {
   property string activeSection: "library"
   property var albumRows: []
   property var coverAttempted: ({})
+  property bool initialCoversQueued: false
   property bool demoMode: false
   property string albumAction: ""
   property string albumActionTarget: ""
@@ -228,7 +229,13 @@ ShellRoot {
     watchChanges: true
     printErrors: false
     onLoaded: {
-      try { var rows = JSON.parse(text()); if (Array.isArray(rows)) { root.albumRows = rows; albumCoverTimer.restart(); } } catch (e) {}
+      try {
+        var rows = JSON.parse(text());
+        if (Array.isArray(rows)) {
+          root.albumRows = rows.filter(function (row) { return row.albumType === 0 || row.albumType === 3 || row.editable === true; });
+          albumCoverTimer.restart();
+        }
+      } catch (e) {}
     }
     onFileChanged: reload()
   }
@@ -250,11 +257,18 @@ ShellRoot {
   }
   Timer {
     id: albumCoverTimer
-    interval: 400
+    interval: 800
     onTriggered: {
-      if (!root.folderView || root.demoMode || root.needLogin || albumCoverProc.running) return;
-      var keys = root.folderChildren().filter(function (row) { return !row.isFolder && !row.cover && !root.coverAttempted[row.id]; })
-                   .slice(0, 8).map(function (row) { return row.id; });
+      if (root.demoMode || root.needLogin || albumCoverProc.running) return;
+      var rows;
+      if (root.folderView) rows = root.folderChildren();
+      else {
+        if (root.initialCoversQueued) return;
+        root.initialCoversQueued = true;
+        rows = root.albumRows.filter(function (row) { return !row.parent; }).slice(0, 5);
+      }
+      var keys = rows.filter(function (row) { return !row.isFolder && !row.cover && !root.coverAttempted[row.id]; })
+                     .slice(0, 8).map(function (row) { return row.id; });
       if (!keys.length) return;
       var tried = Object.assign({}, root.coverAttempted);
       keys.forEach(function (key) { tried[key] = true; });

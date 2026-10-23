@@ -35,13 +35,13 @@ for i in range(750):
 (cache / "index.json").write_text(json.dumps(items))
 (cache / "album-index.json").write_text(json.dumps([
     {"id": "fabricated-folder", "title": "Trips", "zone": "PrimarySync", "parent": None,
-     "isFolder": True, "depth": 0, "cover": ""},
+     "isFolder": True, "albumType": 3, "editable": True, "depth": 0, "cover": ""},
     {"id": "fabricated-subfolder", "title": "Summer", "zone": "PrimarySync",
-     "parent": "fabricated-folder", "isFolder": True, "depth": 1, "cover": ""},
+     "parent": "fabricated-folder", "isFolder": True, "albumType": 3, "editable": True, "depth": 1, "cover": ""},
     {"id": "fabricated-album", "title": "Fabricated Album", "zone": "PrimarySync",
-     "parent": "fabricated-subfolder", "isFolder": False, "depth": 2, "cover": str(thumb)},
+     "parent": "fabricated-subfolder", "isFolder": False, "albumType": 0, "editable": True, "depth": 2, "cover": str(thumb)},
     {"id": "fabricated-root-album", "title": "Favorites from a Trip", "zone": "PrimarySync",
-     "parent": None, "isFolder": False, "depth": 0, "cover": str(thumb)}]))
+     "parent": None, "isFolder": False, "albumType": 0, "editable": True, "depth": 0, "cover": str(thumb)}]))
 (cache / "albums").mkdir(exist_ok=True)
 (cache / "albums" / "fabricated-album.json").write_text(json.dumps({
     "albumId": "fabricated-album", "ids": [item["id"] for item in items[::13]], "complete": True}))

@@ -9,6 +9,7 @@ Rectangle {
   property int indent: 0
   property bool expandable: false
   property bool expanded: false
+  property string thumbnail: ""
   signal activated()
   signal expansionRequested()
 
@@ -29,12 +30,28 @@ Rectangle {
   }
   Text {
     x: 16 + root.indent + (root.expandable ? 17 : 0)
+    visible: !root.thumbnail
     anchors.verticalCenter: parent.verticalCenter
     width: 23
     text: root.icon
     color: root.theme.accent
     font.family: root.theme.fontFamily
     font.pixelSize: 16
+  }
+  Rectangle {
+    x: 16 + root.indent + (root.expandable ? 17 : 0)
+    anchors.verticalCenter: parent.verticalCenter
+    width: 23; height: 23; radius: 3
+    visible: root.thumbnail !== ""
+    color: root.theme.lighterBackground
+    clip: true
+    Image {
+      anchors.fill: parent
+      source: root.thumbnail ? "file://" + root.thumbnail : ""
+      fillMode: Image.PreserveAspectCrop
+      asynchronous: true
+      cache: true
+    }
   }
   Text {
     x: 47 + root.indent + (root.expandable ? 17 : 0)
