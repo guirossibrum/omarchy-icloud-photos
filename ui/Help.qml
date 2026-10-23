@@ -21,6 +21,7 @@ Rectangle {
       ["page up  page down", "move a few rows"],
       ["g  G  home  end", "oldest, newest"],
       ["-  +", "smaller, larger thumbnails"],
+      ["ctrl + b", "toggle the sidebar"],
       ["r", "sync now"],
       ["q", "quit"]
     ]},
@@ -30,7 +31,7 @@ Rectangle {
       ["u", "undo the last delete"],
       ["o", "open in the default app"],
       ["ctrl + c  y", "copy the image, or the files"],
-      ["right-click", "open the Copy menu"],
+      ["right-click  or  …", "open photo actions"],
       ["Y", "copy the path"],
       ["s", "save to ~/Downloads as JPEG or MP4"],
       ["W", "set as the Omarchy wallpaper"]

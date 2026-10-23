@@ -55,6 +55,8 @@ def metadata(asset, account, zone):
     name = asset.filename
     raw_date = field(record, "assetDate")
     capture = datetime.fromtimestamp(raw_date / 1000, timezone.utc) if raw_date is not None else None
+    added = field(record, "addedDate")
+    favorite = field(record, "isFavorite")
     try:
         versions = asset.versions
     except (KeyError, ValueError, TypeError):
@@ -72,7 +74,9 @@ def metadata(asset, account, zone):
                 width=field(master, "resOriginalWidth"), height=field(master, "resOriginalHeight"),
                 timezone=field(record, "timeZone") or field(master, "timeZone"),
                 location=json.dumps(location) if location is not None else None,
-                camera=camera, size=field(master, "resOriginalRes") and field(master, "resOriginalRes").get("size"))
+                camera=camera, size=field(master, "resOriginalRes") and field(master, "resOriginalRes").get("size"),
+                added_at=added / 1000 if isinstance(added, (int, float)) else None,
+                favorite=int(bool(favorite)) if favorite is not None else None)
 
 
 class Catalog:
@@ -89,6 +93,7 @@ class Catalog:
               record TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
               captured TEXT, ts REAL, width INTEGER, height INTEGER,
               timezone TEXT, location TEXT, camera TEXT, size INTEGER, thumb TEXT,
+              added_at REAL, favorite INTEGER,
               original TEXT, motion TEXT, owned INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL DEFAULT 'cloud-only', error TEXT,
               seen INTEGER NOT NULL DEFAULT 0,
@@ -98,17 +103,23 @@ class Catalog:
               account TEXT NOT NULL, zone TEXT NOT NULL, full_at INTEGER NOT NULL,
               PRIMARY KEY(account, zone));
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(assets)")}
+        for name, kind in (("added_at", "REAL"), ("favorite", "INTEGER")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE assets ADD COLUMN {name} {kind}")
+        self.db.commit()
 
     def upsert(self, data, seen):
         self.db.execute("""INSERT INTO assets
             (id, account, zone, record, name, kind, captured, ts, width, height,
-             timezone, location, camera, size, seen)
+             timezone, location, camera, size, added_at, favorite, seen)
             VALUES (:id,:account,:zone,:record,:name,:kind,:captured,:ts,:width,:height,
-                    :timezone,:location,:camera,:size,:seen)
+                    :timezone,:location,:camera,:size,:added_at,:favorite,:seen)
             ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind,
             captured=excluded.captured, ts=excluded.ts, width=excluded.width,
             height=excluded.height, location=excluded.location, camera=excluded.camera,
-            size=excluded.size, timezone=excluded.timezone, seen=excluded.seen,
+            size=excluded.size, timezone=excluded.timezone, added_at=excluded.added_at,
+            favorite=excluded.favorite, seen=excluded.seen,
             state=CASE WHEN assets.state IN ('deleted','absent') THEN 'cloud-only' ELSE assets.state END""", {**data, "seen": seen})
 
     def get(self, key):
@@ -143,6 +154,7 @@ class Catalog:
                 shared=r["zone"] != "PrimarySync", duration=0,
                 width=r["width"], height=r["height"], location=json.loads(r["location"]) if r["location"] else None,
                 camera=r["camera"], size=r["size"], downloaded=bool(original),
+                addedAt=r["added_at"], favorite=bool(r["favorite"]) if r["favorite"] is not None else None,
                 evictable=bool(original and r["owned"]),
                 state=("downloaded" if original else "cloud-only") if r["state"] != "failed" else "failed",
                 error=r["error"] or ""))

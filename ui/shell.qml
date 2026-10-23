@@ -29,7 +29,12 @@ ShellRoot {
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy-icloud-photos/config"
 
   property var items: []
+  property var libraryItems: []
   property var days: []          // [{label, indices: [int]}]
+  property string activeSection: "library"
+  property string searchText: ""
+  property bool sidebarOpen: true
+  property bool slideshowRunning: false
   property int selected: -1
   onSelectedChanged: if (grid && !suppressReveal) grid.revealIndex(selected)
   // OMARCHY_ICLOUD_PHOTOS_TOUR=1: scroll the grid from top to bottom by itself and
@@ -162,7 +167,7 @@ ShellRoot {
     onLoaded: {
       var next = root.parseAppleId(text());
       root.skipTimer = /^\s*SKIP_TIMER=1\s*$/m.test(text());
-      if (root.appleId && next !== root.appleId) { root.rebuild([], -1); root.startSync(); }
+      if (root.appleId && next !== root.appleId) { root.libraryItems = []; root.rebuild([], -1); root.startSync(); }
       root.appleId = next;
       root.configLoaded = true;
     }
@@ -243,16 +248,20 @@ ShellRoot {
     downloadingId = "";
     if (code === 0 && path) {
       failedDownloadId = "";
-      var list = items.slice();
-      for (var i = 0; i < list.length; i++) if (list[i].id === id) {
-        var it = Object.assign({}, list[i]);
+      var master = libraryItems.slice();
+      for (var i = 0; i < master.length; i++) if (master[i].id === id) {
+        var it = Object.assign({}, master[i]);
         if (component === "motion") it.video = path;
         else { it.path = path; it.preview = /\.(heic|heif|tif|tiff|dng)$/i.test(path) ? it.thumb : path;
                it.downloaded = true; it.evictable = true; it.state = "downloaded"; if (it.kind === "video") it.video = path; }
-        list[i] = it;
+        master[i] = it;
         break;
       }
-      items = list;
+      libraryItems = master;
+      var visible = filterItems(master);
+      var selectedId = current ? current.id : id;
+      var selectedIndex = visible.findIndex(function (x) { return x.id === selectedId; });
+      rebuild(visible, selectedIndex >= 0 ? selectedIndex : visible.length - 1);
       if (infoOpen && current && current.id === id) { infoForId = ""; fetchInfo(); }
       if (callback) callback();
     } else {
@@ -399,9 +408,46 @@ ShellRoot {
     try { list = JSON.parse(raw); } catch (e) { return; }
     if (!Array.isArray(list)) return;
     var keepId = current ? current.id : null;
+    libraryItems = list;
+    list = filterItems(list);
     var idx = -1;
     if (keepId) for (var j = 0; j < list.length; j++) if (list[j].id === keepId) { idx = j; break; }
     rebuild(list, idx >= 0 ? idx : list.length - 1);
+  }
+
+  function sectionTitle() {
+    var names = { library: "Library", favorites: "Favorites", recents: "Recents",
+                  downloaded: "Downloaded", videos: "Videos", live: "Live Photos",
+                  shared: "Shared Library" };
+    return names[activeSection] || "Library";
+  }
+
+  function matchesSection(it) {
+    if (searchText && String(it.name || "").toLocaleLowerCase().indexOf(searchText.toLocaleLowerCase()) < 0) return false;
+    if (activeSection === "favorites") return it.favorite === true;
+    if (activeSection === "recents") return it.addedAt != null && it.addedAt >= Date.now() / 1000 - 30 * 86400;
+    if (activeSection === "downloaded") return it.downloaded === true;
+    if (activeSection === "videos") return it.kind === "video";
+    if (activeSection === "live") return it.kind === "live";
+    if (activeSection === "shared") return it.shared === true;
+    return true;
+  }
+
+  function filterItems(list) { return list.filter(function (it) { return root.matchesSection(it); }); }
+
+  function selectSection(section) {
+    if (activeSection === section) return;
+    activeSection = section;
+    viewerOpen = false;
+    clearChecked();
+    pinBottom = true;
+    var list = filterItems(libraryItems);
+    rebuild(list, list.length - 1);
+  }
+
+  onSearchTextChanged: {
+    var list = filterItems(libraryItems);
+    rebuild(list, list.length - 1);
   }
 
   function groupDays(list) {
@@ -431,7 +477,7 @@ ShellRoot {
   }
 
   function rangeLabel() {
-    return "full library";
+    return sectionTitle();
   }
 
   function parseAppleId(raw) {
@@ -570,6 +616,12 @@ ShellRoot {
     return viewerOpen ? (current ? [current] : []) : targets();
   }
 
+  function latestItems(list) {
+    return list.map(function (it) {
+      return root.libraryItems.find(function (candidate) { return candidate.id === it.id; }) || it;
+    });
+  }
+
   function showCopyMenu(source, x, y, index) {
     if (needLogin || helpOpen || pendingDelete) return;
     var pos = source.mapToItem(keys, x, y);
@@ -588,8 +640,9 @@ ShellRoot {
     if (copier.running) return;
     if (!list) list = copyTargets();
     if (list.length === 0) return;
+    list = latestItems(list);
     var pending = list.filter(function (it) { return it.state !== undefined && !it.downloaded; });
-    if (pending.length) { ensureMany(pending, function () { root.copyCurrent(); }); return; }
+    if (pending.length) { ensureMany(pending, function () { root.copyCurrent(list); }); return; }
     if (list.length > 1) {
       // A list of files: file managers paste them as copies, chat apps as
       // attachments. Plain text gets the paths, one per line.
@@ -613,11 +666,12 @@ ShellRoot {
   // full-size JPEG, HDR video becomes its SDR MP4 copy, other video is
   // remuxed to MP4 without re-encoding, JPEG and PNG are copied as they are.
   // Never overwrites: a taken name gets a numbered suffix.
-  function saveToDownloads() {
-    var list = targets();
+  function saveToDownloads(list) {
+    if (!list) list = targets();
     if (list.length === 0) return;
+    list = latestItems(list);
     var pending = list.filter(function (it) { return it.state !== undefined && !it.downloaded; });
-    if (pending.length) { ensureMany(pending, function () { root.saveToDownloads(); }); return; }
+    if (pending.length) { ensureMany(pending, function () { root.saveToDownloads(list); }); return; }
     var args = [];
     for (var i = 0; i < list.length; i++) {
       var it = list[i];
@@ -697,7 +751,7 @@ ShellRoot {
     if (current && current.id !== failedDownloadId && !originalDownload.running) downloadError = "";
   }
   onViewerOpenChanged: {
-    if (!viewerOpen) infoOpen = false;
+    if (!viewerOpen) { infoOpen = false; slideTimer.stop(); slideshowRunning = false; }
   }
 
   function copyPath() {
@@ -728,6 +782,27 @@ ShellRoot {
     var list = targets();
     if (list.length === 0) return;
     pendingDelete = list;
+  }
+
+  function askDeleteItems(list) {
+    if (list && list.length > 0) pendingDelete = latestItems(list);
+  }
+
+  function startSlideshow() {
+    if (!current) return;
+    viewerOpen = true;
+    slideshowRunning = true;
+    slideTimer.start();
+  }
+
+  Timer {
+    id: slideTimer
+    interval: 4000
+    repeat: true
+    onTriggered: {
+      if (!root.viewerOpen || root.items.length < 2) { stop(); root.slideshowRunning = false; return; }
+      root.jumpTo((root.selected + 1) % root.items.length, false);
+    }
   }
 
   function confirmDelete() {
@@ -835,6 +910,7 @@ ShellRoot {
   }
 
   function removeItem(id) {
+    libraryItems = libraryItems.filter(function (it) { return it.id !== id; });
     var list = items.slice();
     var idx = -1;
     for (var i = 0; i < list.length; i++) if (list[i].id === id) { idx = i; break; }
@@ -845,6 +921,12 @@ ShellRoot {
   }
 
   function insertItem(it) {
+    var master = libraryItems.slice();
+    var masterPos = master.length;
+    for (var m = 0; m < master.length; m++) if (master[m].ts > it.ts) { masterPos = m; break; }
+    master.splice(masterPos, 0, it);
+    libraryItems = master;
+    if (!matchesSection(it)) return;
     var list = items.slice();
     var pos = list.length;
     for (var i = 0; i < list.length; i++) if (list[i].ts > it.ts) { pos = i; break; }
@@ -957,6 +1039,11 @@ ShellRoot {
         theme: appTheme
         onRequestCopy: items => root.copyCurrent(items)
         onRequestEvict: items => root.evictLocal(items)
+        onRequestDownload: items => root.ensureMany(items.filter(function (it) { return !it.downloaded; }), function () { toast.show("Originals downloaded", 2500); })
+        onRequestSave: items => root.saveToDownloads(items)
+        onRequestOpen: root.openCurrent()
+        onRequestSlideshow: root.startSlideshow()
+        onRequestDelete: root.askDeleteItems(items)
         onClosed: keys.forceActiveFocus()
       }
 
@@ -978,6 +1065,7 @@ ShellRoot {
         }
         var shift = (event.modifiers & Qt.ShiftModifier) !== 0;
         var ctrl = (event.modifiers & Qt.ControlModifier) !== 0;
+        if (ctrl && k === Qt.Key_B) { root.sidebarOpen = !root.sidebarOpen; event.accepted = true; return; }
         if (t === "d" || k === Qt.Key_Delete) { root.askDelete(); event.accepted = true; return; }
         if (t === "u") { root.undoDelete(); event.accepted = true; return; }
         if (t === "s") { root.saveToDownloads(); event.accepted = true; return; }
@@ -1031,74 +1119,104 @@ ShellRoot {
         event.accepted = true;
       }
 
+      Sidebar {
+        id: sidebar
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.bottom: parent.bottom
+        width: root.sidebarOpen && !root.needLogin ? 228 : 0
+        visible: width > 0
+        theme: appTheme
+        section: root.activeSection
+        onSectionSelected: section => root.selectSection(section)
+        onToggleRequested: root.sidebarOpen = false
+      }
+
       // ---- Header ---------------------------------------------------------
       Rectangle {
         id: header
         anchors.top: parent.top
-        anchors.left: parent.left
+        anchors.left: sidebar.right
         anchors.right: parent.right
-        height: 56
+        height: 52
         color: appTheme.darkBackground
 
         Row {
           anchors.left: parent.left
-          anchors.leftMargin: 20
+          anchors.leftMargin: 12
           anchors.verticalCenter: parent.verticalCenter
-          spacing: 14
-          Text {
-            text: "Omarchy iCloud Photos"
-            color: appTheme.brightForeground
-            font.family: appTheme.fontFamily
-            font.pixelSize: 17
-            font.bold: true
+          spacing: 4
+          ActionIcon {
+            theme: appTheme; icon: "\uf0db"; hint: "Toggle sidebar (Ctrl+B)"
+            onActivated: root.sidebarOpen = !root.sidebarOpen
           }
-          Text {
-            anchors.baseline: parent.children[0].baseline
-            text: root.rangeLabel()
-            color: appTheme.foreground
-            font.family: appTheme.fontFamily
-            font.pixelSize: appTheme.fontSize
+          ActionIcon {
+            theme: appTheme; icon: "\uf00a"; hint: "Photo grid"
+            onActivated: root.viewerOpen = false
           }
-          Text {
-            anchors.baseline: parent.children[0].baseline
-            text: root.items.length > 0 ? root.items.length + " items" : ""
-            color: appTheme.darkForeground
-            font.family: appTheme.fontFamily
-            font.pixelSize: appTheme.fontSize
+          ActionIcon {
+            theme: appTheme; icon: "\uf068"; hint: "Smaller thumbnails"
+            onActivated: root.setCell(root.cell - 24)
+          }
+          Slider {
+            id: toolbarZoom
+            anchors.verticalCenter: parent.verticalCenter
+            width: 82; from: 100; to: 400; stepSize: 4
+            value: root.cell
+            onMoved: root.setCell(value)
+          }
+          ActionIcon {
+            theme: appTheme; icon: "\uf067"; hint: "Larger thumbnails"
+            onActivated: root.setCell(root.cell + 24)
           }
         }
 
         Row {
           anchors.right: parent.right
-          anchors.rightMargin: 16
+          anchors.rightMargin: 8
           anchors.verticalCenter: parent.verticalCenter
-          spacing: 12
-          Text {
+          spacing: 3
+          ActionIcon {
+            theme: appTheme; icon: "\uf0ed"; hint: "Sync library"
+            onActivated: root.startSync()
+          }
+          ActionIcon {
+            theme: appTheme; icon: "\uf14d"; hint: "Save copy to Downloads"
+            available: root.current !== null
+            onActivated: root.saveToDownloads()
+          }
+          ActionIcon {
+            theme: appTheme; icon: "\uf004"; hint: "Show Favorites"
+            onActivated: root.selectSection("favorites")
+          }
+          ActionIcon {
+            theme: appTheme; icon: "\uf019"; hint: "Download original"
+            available: root.current !== null && !root.current.downloaded
+            onActivated: root.ensureOriginal(root.current)
+          }
+          ActionIcon {
+            theme: appTheme; icon: "\uf1f8"; hint: "Delete from iCloud…"
+            available: root.current !== null
+            onActivated: root.askDelete()
+          }
+          ActionIcon {
+            theme: appTheme; icon: "\uf141"; hint: "More actions"
+            available: root.current !== null
+            onActivated: root.showCopyMenu(this, width / 2, height, -1)
+          }
+          TextField {
+            width: 174; height: 30
             anchors.verticalCenter: parent.verticalCenter
-            text: root.syncedLabel()
-            color: root.busy ? appTheme.accent : appTheme.darkForeground
+            placeholderText: "Search Photos"
+            color: appTheme.brightForeground
             font.family: appTheme.fontFamily
             font.pixelSize: appTheme.fontSize - 1
-          }
-          Rectangle {
-            width: 34; height: 34; radius: 6
-            color: refreshArea.containsMouse ? appTheme.lighterBackground : "transparent"
-            Text {
-              anchors.centerIn: parent
-              text: ""
-              color: root.busy ? appTheme.accent : appTheme.foreground
-              font.family: appTheme.fontFamily
-              font.pixelSize: 15
-              RotationAnimation on rotation {
-                running: root.busy; loops: Animation.Infinite; from: 0; to: 360; duration: 1400
-              }
-            }
-            MouseArea {
-              id: refreshArea
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.startSync()
+            text: root.searchText
+            onTextEdited: root.searchText = text
+            background: Rectangle {
+              radius: 6
+              color: appTheme.background
+              border.color: appTheme.lighterBackground
             }
           }
         }
@@ -1108,7 +1226,7 @@ ShellRoot {
       Rectangle {
         id: banner
         anchors.top: header.bottom
-        anchors.left: parent.left
+        anchors.left: sidebar.right
         anchors.right: parent.right
         visible: root.status.state === "error"
         height: visible ? bannerText.implicitHeight + 20 : 0
@@ -1131,7 +1249,7 @@ ShellRoot {
       Flickable {
         id: grid
         anchors.top: banner.bottom
-        anchors.left: parent.left
+        anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.bottom: footer.top
         clip: true
@@ -1338,6 +1456,31 @@ ShellRoot {
           width: grid.width - 40
           spacing: 22
 
+          Row {
+            spacing: 12
+            Text {
+              text: root.sectionTitle()
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: 19
+              font.bold: true
+            }
+            Text {
+              anchors.baseline: parent.children[0].baseline
+              text: root.items.length + (root.items.length === 1 ? " item" : " items")
+              color: appTheme.darkForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+            }
+            Text {
+              anchors.baseline: parent.children[0].baseline
+              text: root.busy ? "Syncing…" : ""
+              color: appTheme.accent
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+            }
+          }
+
           Repeater {
             id: daysRepeater
             model: root.days
@@ -1387,6 +1530,7 @@ ShellRoot {
                       checked: !!root.items[modelData] && root.checked[root.items[modelData].id] === true
                       onSelectedChanged: if (selected) grid.reveal(this)
                       onContextMenuRequested: (x, y) => root.showCopyMenu(this, x, y, index)
+                      onMenuRequested: (x, y) => root.showCopyMenu(this, x, y, index)
                       onClicked: modifiers => {
                         root.pinBottom = false;
                         if (modifiers & Qt.ShiftModifier) root.jumpTo(index, true);
@@ -1413,14 +1557,14 @@ ShellRoot {
         visible: root.items.length === 0 && !root.needLogin
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
-          text: root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No photos in the library")
+          text: root.busy ? "First sync…" : (root.indexMissing ? "Nothing synced yet" : "No items in " + root.sectionTitle())
           color: appTheme.foreground
           font.family: appTheme.fontFamily
           font.pixelSize: 16
         }
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
-          text: root.busy ? "This can take a few minutes" : "Press r to sync, ? for the keys"
+          text: root.busy ? "Items will appear as metadata arrives" : (root.searchText ? "Try a different search" : "Press r to sync, ? for the keys")
           color: appTheme.darkForeground
           font.family: appTheme.fontFamily
           font.pixelSize: appTheme.fontSize
@@ -1430,7 +1574,7 @@ ShellRoot {
       // ---- Footer ---------------------------------------------------------
       Rectangle {
         id: footer
-        anchors.left: parent.left
+        anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         height: 34
@@ -1572,7 +1716,7 @@ ShellRoot {
       // ---- Sign-in ----------------------------------------------------------
       Rectangle {
         anchors.top: header.bottom
-        anchors.left: parent.left
+        anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.bottom: footer.top
         visible: root.needLogin

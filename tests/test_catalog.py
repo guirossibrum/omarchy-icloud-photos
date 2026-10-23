@@ -1,6 +1,7 @@
 """Synthetic cloud contract tests. These never authenticate or touch a live account."""
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -122,6 +123,48 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(missing["thumb"])
         self.assertIsNone(missing["location"])
         self.assertIsNone(missing["timezone"])
+
+    def test_favorites_recents_metadata_and_restart_safe_migration(self):
+        asset = self.personal.assets[0]
+        asset._asset_record["fields"]["isFavorite"] = {"value": True}
+        asset._asset_record["fields"]["addedDate"] = {"value": 1700000000000}
+        catalog.sync(self.cat, self.cfg, self.api)
+        key = catalog.item_key(self.cat.account, "PrimarySync", "p0")
+        item = next(x for x in json.loads((self.cache / "index.json").read_text()) if x["id"] == key)
+        self.assertTrue(item["favorite"])
+        self.assertEqual(item["addedAt"], 1700000000)
+        unknown = next(x for x in json.loads((self.cache / "index.json").read_text()) if x["id"] != key)
+        self.assertIsNone(unknown["favorite"])
+        self.assertIsNone(unknown["addedAt"])
+        restarted = catalog.Catalog(self.cache, self.cat.account)
+        self.addCleanup(restarted.db.close)
+        self.assertTrue(restarted.get(key)["favorite"])
+        self.assertEqual(restarted.get(key)["added_at"], 1700000000)
+
+    def test_existing_catalog_schema_migrates_without_replacing_records(self):
+        old_cache = Path(self.tmp.name) / "old-cache"
+        old_cache.mkdir()
+        db = sqlite3.connect(old_cache / "catalog.sqlite3")
+        db.executescript("""
+            CREATE TABLE assets (
+              id TEXT PRIMARY KEY, account TEXT NOT NULL, zone TEXT NOT NULL,
+              record TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+              captured TEXT, ts REAL, width INTEGER, height INTEGER,
+              timezone TEXT, location TEXT, camera TEXT, size INTEGER, thumb TEXT,
+              original TEXT, motion TEXT, owned INTEGER NOT NULL DEFAULT 0,
+              state TEXT NOT NULL DEFAULT 'cloud-only', error TEXT,
+              seen INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(account, zone, record));
+        """)
+        db.execute("INSERT INTO assets(id,account,zone,record,name,kind) VALUES(?,?,?,?,?,?)",
+                   ("fabricated-key", self.cat.account, "PrimarySync", "fabricated-record", "fabricated.jpg", "photo"))
+        db.commit()
+        db.close()
+        migrated = catalog.Catalog(old_cache, self.cat.account)
+        self.addCleanup(migrated.db.close)
+        self.assertEqual(migrated.get("fabricated-key")["name"], "fabricated.jpg")
+        self.assertIsNone(migrated.get("fabricated-key")["favorite"])
+        self.assertIsNone(migrated.get("fabricated-key")["added_at"])
 
     def test_first_sync_publishes_cards_before_thumbnail_requests(self):
         exports = []

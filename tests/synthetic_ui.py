@@ -29,7 +29,9 @@ for i in range(750):
                       name=f"fabricated-{i:04}.{'mov' if kind == 'video' else 'jpg'}", kind=kind, ts=date.timestamp(),
                       captured=date.isoformat(), date=date.strftime("%Y-%m-%d"), time=date.strftime("%H:%M"),
                       thumb="" if i == 748 else str(thumb), preview="" if i == 748 else str(thumb), path="", video="", shared=False,
-                      duration=0, downloaded=False, state="cloud-only", error=""))
+                      duration=0, downloaded=False, state="cloud-only", error="",
+                      favorite=i % 11 == 0, addedAt=(datetime.now(timezone.utc) - timedelta(days=i % 45)).timestamp(),
+                      evictable=False))
 (cache / "index.json").write_text(json.dumps(items))
 (cache / "status.json").write_text(json.dumps(dict(state="ok", message="", count=len(items),
                                                    at=datetime.now(timezone.utc).isoformat())))

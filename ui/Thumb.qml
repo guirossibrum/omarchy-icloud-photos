@@ -19,6 +19,7 @@ Rectangle {
 
   signal clicked(int modifiers)
   signal contextMenuRequested(real x, real y)
+  signal menuRequested(real x, real y)
 
   width: size
   height: size
@@ -26,6 +27,7 @@ Rectangle {
   color: theme.darkBackground
   border.width: (selected || checked) ? 3 : 0
   border.color: selected ? theme.accent : Qt.darker(theme.accent, 1.4)
+  HoverHandler { id: tileHover }
 
   Image {
     id: thumbnail
@@ -39,20 +41,33 @@ Rectangle {
     smooth: true
   }
 
-  Text {
+  Item {
     anchors.centerIn: parent
     visible: thumbnail.status !== Image.Ready
-    text: root.syncing ? "Loading thumbnail…" : "No thumbnail"
-    color: theme.foreground
-    font.family: theme.fontFamily
-    font.pixelSize: 12
+    width: 76; height: 62
+    Rectangle {
+      x: 7; y: 3; width: 54; height: 43; radius: 5
+      color: "transparent"; border.color: root.theme.darkForeground; border.width: 4
+    }
+    Rectangle {
+      x: 22; y: 16; width: 54; height: 43; radius: 5
+      color: root.theme.darkBackground
+      border.color: root.theme.foreground; border.width: 4
+      Text {
+        anchors.centerIn: parent
+        text: "\uf03e"
+        color: root.theme.foreground
+        font.family: root.theme.fontFamily
+        font.pixelSize: 25
+      }
+    }
   }
 
   Rectangle {
     anchors.right: parent.right
     anchors.bottom: parent.bottom
     anchors.margins: 8
-    visible: !!item && item.state !== undefined
+    visible: !!item && item.state !== undefined && (root.downloading || item.state === "failed" || item.downloaded)
     width: stateLabel.implicitWidth + 12
     height: 20
     radius: 4
@@ -60,7 +75,7 @@ Rectangle {
     Text {
       id: stateLabel
       anchors.centerIn: parent
-      text: item ? (root.downloading ? "Downloading" : item.state === "downloaded" ? "Downloaded" : item.state === "failed" ? "Failed" : "In iCloud") : ""
+      text: item ? (root.downloading ? "Downloading" : item.state === "failed" ? "Failed" : "Downloaded") : ""
       color: "white"
       font.family: theme.fontFamily
       font.pixelSize: 10
@@ -128,8 +143,8 @@ Rectangle {
   // it. Steps aside for the check mark when the item is ticked.
   Rectangle {
     visible: !!item && item.shared === true
-    anchors.right: root.checked ? check.left : parent.right
-    anchors.rightMargin: root.checked ? 6 : 8
+    anchors.left: parent.left
+    anchors.leftMargin: item && item.kind === "live" ? 36 : 8
     anchors.top: parent.top
     anchors.topMargin: 8
     width: 22; height: 22; radius: 11
@@ -165,6 +180,7 @@ Rectangle {
   }
 
   MouseArea {
+    id: cardArea
     anchors.fill: parent
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
@@ -172,6 +188,42 @@ Rectangle {
     onClicked: mouse => {
       if (mouse.button === Qt.RightButton) root.contextMenuRequested(mouse.x, mouse.y);
       else root.clicked(mouse.modifiers);
+    }
+  }
+
+  // A cloud mark means the full original is absent. Hover replaces it with
+  // the same small actions control used by iCloud Photos.
+  Rectangle {
+    visible: !!item && item.state !== undefined && !item.downloaded && !root.checked && !tileHover.hovered
+    anchors.right: parent.right; anchors.top: parent.top
+    anchors.margins: 8
+    width: 24; height: 24; radius: 12
+    color: Qt.rgba(0, 0, 0, 0.55)
+    Text {
+      anchors.centerIn: parent
+      text: "\uf0c2"
+      color: "white"
+      font.family: root.theme.fontFamily
+      font.pixelSize: 14
+    }
+  }
+  Rectangle {
+    visible: tileHover.hovered && !root.checked
+    anchors.right: parent.right; anchors.top: parent.top
+    anchors.margins: 8
+    width: 24; height: 24; radius: 12
+    color: "white"
+    Text {
+      anchors.centerIn: parent
+      text: "\uf141"
+      color: root.theme.darkBackground
+      font.family: root.theme.fontFamily
+      font.pixelSize: 14
+    }
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.menuRequested(parent.x + width / 2, parent.y + height)
     }
   }
 }

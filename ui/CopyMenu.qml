@@ -3,74 +3,76 @@ import QtQuick.Controls.Basic
 
 Menu {
   id: root
-
   required property var theme
   property var items: []
   signal requestCopy(var items)
   signal requestEvict(var items)
+  signal requestDownload(var items)
+  signal requestSave(var items)
+  signal requestOpen()
+  signal requestSlideshow()
+  signal requestDelete()
 
-  width: 260
-  padding: 4
+  width: 300
+  padding: 5
   margins: 6
   popupType: Popup.Item
   modal: true
   dim: false
-
   background: Rectangle {
-    radius: 8
+    radius: 9
     color: root.theme.darkBackground
     border.color: root.theme.lighterBackground
     border.width: 1
   }
 
-  MenuItem {
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf019"
+    text: root.items.length > 1 ? "Download " + root.items.length + " originals" : "Download Original"
+    enabled: root.items.some(function (it) { return !it.downloaded; })
+    onTriggered: root.requestDownload(root.items)
+  }
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf14d"
+    text: root.items.length > 1 ? "Save " + root.items.length + " copies…" : "Save Copy…"
+    enabled: root.items.length > 0
+    onTriggered: root.requestSave(root.items)
+  }
+  MenuSeparator {}
+  ActionMenuItem {
     id: copyItem
+    theme: root.theme; glyph: "\uf0c5"
     text: root.items.length > 1 ? "Copy " + root.items.length + " files" : "Copy"
     enabled: root.items.length > 0
-    implicitHeight: 36
     onTriggered: root.requestCopy(root.items)
-
-    // A modal menu blocks shortcuts on the window underneath it.
     Shortcut {
       sequence: "Ctrl+C"
       enabled: root.visible && copyItem.enabled
-      onActivated: {
-        root.requestCopy(root.items);
-        root.close();
-      }
-    }
-
-    background: Rectangle {
-      radius: 4
-      color: copyItem.highlighted ? root.theme.selection : "transparent"
-    }
-
-    contentItem: Item {
-      implicitHeight: label.implicitHeight
-      Text {
-        id: label
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-        text: copyItem.text
-        color: root.theme.brightForeground
-        font.family: root.theme.fontFamily
-        font.pixelSize: root.theme.fontSize
-      }
-      Text {
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        text: "Ctrl+C"
-        color: root.theme.foreground
-        font.family: root.theme.fontFamily
-        font.pixelSize: root.theme.fontSize - 1
-      }
+      onActivated: { root.requestCopy(root.items); root.close(); }
     }
   }
-
-  MenuItem {
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf08e"; text: "Open Externally"
+    enabled: root.items.length === 1
+    onTriggered: root.requestOpen()
+  }
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf144"; text: "Start Slideshow"
+    enabled: root.items.length === 1
+    onTriggered: root.requestSlideshow()
+  }
+  MenuSeparator {}
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf2ed"
     text: "Remove local download — keep in iCloud"
     enabled: root.items.some(function (it) { return it.evictable === true; })
-    implicitHeight: 40
     onTriggered: root.requestEvict(root.items)
+  }
+  MenuSeparator {}
+  ActionMenuItem {
+    theme: root.theme; glyph: "\uf1f8"; danger: true
+    text: "Delete from iCloud…"
+    enabled: root.items.length > 0
+    onTriggered: root.requestDelete()
   }
 }
