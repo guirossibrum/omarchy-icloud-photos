@@ -382,9 +382,17 @@ ShellRoot {
   Process { id: opener }
   Process {
     id: favoriteProc
+    property string assetId: ""
+    property var previousFavorite: null
+    property bool requestedFavorite: false
     onExited: (code, status) => {
+      var key = assetId, oldFavorite = previousFavorite;
+      assetId = "";
+      if (code !== 0) {
+        root.updateFavoriteInMemory(key, oldFavorite);
+        toast.show("Could not update favorite", 3000);
+      }
       indexFile.reload();
-      toast.show(code === 0 ? "Favorite updated" : "Could not update favorite", 3000);
     }
   }
   Process {
@@ -482,6 +490,9 @@ ShellRoot {
     var list;
     try { list = JSON.parse(raw); } catch (e) { return; }
     if (!Array.isArray(list)) return;
+    if (favoriteProc.assetId) list = list.map(function (it) {
+      return it.id === favoriteProc.assetId ? Object.assign({}, it, { favorite: favoriteProc.requestedFavorite }) : it;
+    });
     var keepId = current ? current.id : null;
     libraryItems = list;
     list = filterItems(list);
@@ -573,9 +584,20 @@ ShellRoot {
   function toggleFavorite(item) {
     var target = item || current;
     if (!target || favoriteProc.running || target.state === undefined) return;
+    favoriteProc.assetId = target.id;
+    favoriteProc.previousFavorite = target.favorite;
+    favoriteProc.requestedFavorite = target.favorite !== true;
+    updateFavoriteInMemory(target.id, favoriteProc.requestedFavorite);
     favoriteProc.command = [helperScript, "favorite", "--key", target.id,
-                            "--value", target.favorite === true ? "0" : "1"];
+                            "--value", favoriteProc.requestedFavorite ? "1" : "0"];
     favoriteProc.running = true;
+  }
+
+  function updateFavoriteInMemory(id, value) {
+    var list = libraryItems.map(function (it) {
+      return it.id === id ? Object.assign({}, it, { favorite: value }) : it;
+    });
+    applyIndex(JSON.stringify(list));
   }
 
   onSearchTextChanged: {
